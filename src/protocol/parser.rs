@@ -150,6 +150,14 @@ impl Parser {
             self.start += 4;
             return None;
         }
+        // A valid frame header is op(1) + topic_len(4) + payload_len(4) = 9
+        // bytes after the prefix. A total_len smaller than that can never
+        // describe a real frame, and reading the header fields on such a frame
+        // would index past the buffered bytes — reject it instead of panicking.
+        if total_len < MIN_FRAME {
+            self.start += LEN_PREFIX + total_len;
+            return None;
+        }
         if avail < LEN_PREFIX + total_len {
             return None;
         }

@@ -27,6 +27,98 @@ pub fn run_broker(config: Config) -> anyhow::Result<()> {
 
     info!(addr = %config.addr, http = %config.http_addr, mode = %config.mode, cores = config.cores, "zhensegg broker starting");
 
+    // Reloadable transport security (TLS + auth tokens), shared by the accept
+    // loops and the HTTP admin server so a SIGHUP rotation applies to both.
+    //
+    // Created as an empty placeholder first: the signal thread (which owns the
+    // SIGHUP/reload path) is handed a clone of this Arc, and the slow initial
+    // load (TLS certificate parsing) happens only *after* the OS signal handlers
+    // are confirmed installed, so an early SIGHUP can never hit the default
+    // (terminate) disposition and kill a freshly booted broker.
+    let sec = Arc::new(SharedSecurity::default());
+
+    // Graceful shutdown flag + signal handler (SIGTERM/SIGINT/ctrl-C drain, plus
+    // SIGHUP on unix to reload TLS certs and auth tokens without restart).
+    //
+    // The handler thread registers all OS signal handlers *synchronously* and
+    // then signals readiness through a channel. `run_broker` blocks on that
+    // channel before doing any slow work (store setup, TLS load), so there is no
+    // startup window in which a SIGHUP would hit the default (terminate)
+    // disposition and kill a freshly booted broker.
+    let shutting_down = Arc::new(AtomicBool::new(false));
+    let (signal_ready_tx, signal_ready_rx) = std::sync::mpsc::channel::<()>();
+    {
+        let shutting_down = shutting_down.clone();
+        let _sec = sec.clone();
+        let _cfg = config.clone();
+        let signal_ready_tx = signal_ready_tx;
+        std::thread::spawn(move || {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("signal runtime");
+            rt.block_on(async move {
+                #[cfg(unix)]
+                {
+                    use tokio::signal::unix::{SignalKind, signal};
+                    // Register all handlers up front (synchronously) before we
+                    // tell the caller we are ready, so no rotation signal can be
+                    // lost or mis-handled during startup.
+                    let mut hup = signal(SignalKind::hangup()).expect("sighup");
+                    let mut term = signal(SignalKind::terminate()).expect("sigterm");
+                    let mut int = signal(SignalKind::interrupt()).expect("sigint");
+                    let _ = signal_ready_tx.send(());
+                    tokio::pin!(hup);
+                    tokio::pin!(term);
+                    tokio::pin!(int);
+                    loop {
+                        tokio::select! {
+                            _ = hup.recv() => {
+                                match _sec.reload(&_cfg) {
+                                    Ok(()) => info!("SIGHUP: TLS/auth rotated"),
+                                    Err(e) => {
+                                        use tracing::error;
+                                        error!(error = %e, "SIGHUP reload failed, keeping previous context");
+                                    }
+                                }
+                            }
+                            _ = term.recv() => {
+                                info!("shutdown signal received (SIGTERM), draining");
+                                shutting_down.store(true, Ordering::SeqCst);
+                                break;
+                            }
+                            _ = int.recv() => {
+                                info!("shutdown signal received (SIGINT), draining");
+                                shutting_down.store(true, Ordering::SeqCst);
+                                break;
+                            }
+                        }
+                    }
+                }
+                #[cfg(not(unix))]
+                {
+                    let _ = signal_ready_tx.send(());
+                    wait_for_shutdown_signal().await;
+                    info!("shutdown signal received, draining");
+                    shutting_down.store(true, Ordering::SeqCst);
+                }
+            });
+        });
+    }
+    // Block until the OS signal handlers are guaranteed installed. From here on
+    // an early SIGHUP is handled (reload), never a default terminate.
+    let _ = signal_ready_rx.recv();
+
+    // Initial security load (TLS cert/key parsing, token files). Same code path
+    // as SIGHUP reload; runs only after signal handlers are installed.
+    sec.reload(&config)?;
+    info!(
+        tls = sec.snapshot().0.is_some(),
+        auth = !sec.snapshot().1.initially_authenticated(),
+        http_auth = sec.http_token().is_some(),
+        "security context initialized"
+    );
+
     // Shared store
     let store: Arc<dyn Store> = if config.is_file_mode() {
         info!(path = %config.file, mb = config.ring_capacity_mb, "persistent store (file mode)");
@@ -52,16 +144,6 @@ pub fn run_broker(config: Config) -> anyhow::Result<()> {
         durable_pos: durable_pos_atomic.clone(),
     };
 
-    // Reloadable transport security (TLS + auth tokens), shared by the accept
-    // loops and the HTTP admin server so a SIGHUP rotation applies to both.
-    let sec = Arc::new(SharedSecurity::from_config(&config)?);
-    info!(
-        tls = sec.snapshot().0.is_some(),
-        auth = !sec.snapshot().1.initially_authenticated(),
-        http_auth = sec.http_token().is_some(),
-        "security context initialized"
-    );
-
     // HTTP sidecar (non-blocking, separate thread + runtime)
     {
         let http_config = config.clone();
@@ -72,53 +154,6 @@ pub fn run_broker(config: Config) -> anyhow::Result<()> {
                 .build()
                 .expect("http runtime");
             rt.block_on(metrics_http_server(http_config, health_state, sec));
-        });
-    }
-
-    // Graceful shutdown flag + signal handler (SIGTERM/SIGINT/ctrl-C drain, plus
-    // SIGHUP on unix to reload TLS certs and auth tokens without restart).
-    let shutting_down = Arc::new(AtomicBool::new(false));
-    {
-        let shutting_down = shutting_down.clone();
-        let _sec = sec.clone();
-        let _cfg = config.clone();
-        std::thread::spawn(move || {
-            let rt = tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-                .expect("signal runtime");
-            rt.block_on(async move {
-                #[cfg(unix)]
-                {
-                    use tokio::signal::unix::{SignalKind, signal};
-                    let mut hup = signal(SignalKind::hangup()).expect("sighup");
-                    tokio::pin!(hup);
-                    loop {
-                        tokio::select! {
-                            _ = hup.recv() => {
-                                match _sec.reload(&_cfg) {
-                                    Ok(()) => info!("SIGHUP: TLS/auth rotated"),
-                                    Err(e) => {
-                                        use tracing::error;
-                                        error!(error = %e, "SIGHUP reload failed, keeping previous context");
-                                    }
-                                }
-                            }
-                            _ = wait_for_shutdown_signal() => {
-                                info!("shutdown signal received, draining");
-                                shutting_down.store(true, Ordering::SeqCst);
-                                break;
-                            }
-                        }
-                    }
-                }
-                #[cfg(not(unix))]
-                {
-                    wait_for_shutdown_signal().await;
-                    info!("shutdown signal received, draining");
-                    shutting_down.store(true, Ordering::SeqCst);
-                }
-            });
         });
     }
 

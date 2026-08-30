@@ -1,0 +1,25 @@
+[package]
+name = "zhensegg-fuzz"
+version = "0.1.0"
+edition = "2021"
+publish = false
+description = "Protocol fuzzer + soak harness for the Zhensegg broker"
+
+# Crash loudly: any panic aborts and the child input is saved, so a fuzz run
+# visible to CI/supervisors never silently swallows a defect. We unwind (not
+# abort) in release too so `catch_unwind` in the harness can save the crashing
+# input to disk before reporting it.
+[profile.dev]
+panic = "unwind"
+debug = true
+
+[profile.release]
+panic = "unwind"
+debug = true
+opt-level = 3
+
+[dependencies]
+zhensegg = { path = ".." }
+tokio = { version = "1.38", features = ["full"] }
+rand = "0.8"
+anyhow = "1.0"

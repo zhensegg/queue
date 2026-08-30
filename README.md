@@ -149,18 +149,58 @@ Persistent soak, producer/consumer on separate OS threads, closed-loop acks,
 `O_DIRECT` durability check — see [benchmarks/README.md](benchmarks/README.md)
 for methodology, tunables and current results.
 
+## Fuzzing & soak
+
+`fuzz/` holds a standalone crate (`zhensegg-fuzz`) that both fuzzes the real
+wire parser and soaks a *running* broker binary over TCP, in one Linux
+container:
+
+```bash
+docker build -f fuzz/Dockerfile -t zhensegg-fuzz .
+docker run --rm --privileged zhensegg-fuzz
+```
+
+The entrypoint does three independent checks and fails fast on any regression:
+
+1. **In-process, coverage-guided fuzzing** of the zero-copy wire parser
+   (`zhensegg-fuzz check`). A structure-aware generator emits valid + hostile
+   frames, byte-mutation (bit flips, insert/delete, 4-byte length overwrites,
+   duplicate chunks) drives coverage via structural frame signatures, and any
+   panicking input is saved under `fuzz-crash/`.
+2. **Dispatch soak** against a live plain-TCP+auth broker: parallel flooders
+   interleave garbage and well-formed publish/subscribe/fetch/auth frames for
+   `SOAK_SECS`, then a fresh-connection Ping probe proves the broker still
+   parses and answers. (Truncated mid-stream frames legitimately desync one
+   length-prefixed stream, so liveness is asserted on a brand-new connection.)
+3. **Live SIGHUP rotation**: a TLS+auth broker rotates its cert/key and
+   data-plane + HTTP tokens in place; the new HTTP token serves `200`, the old
+   one returns `401`, and the process survives.
+
+Tunables: `--seconds`/`--iters`/`--corpus`/`--crash` for fuzz, `--addr`
+/`--auth-token`/`--conns`/`--seconds` for soak. The container respects
+`FUZZ_SECS`, `SOAK_SECS` and `SOAK_CONNS` env vars.
+
+Fuzzing earned its keep: it found a real out-of-bounds panic — the frame parser
+indexed `buf[frame_start]` when `total_len < 9` — which was fixed in
+`src/protocol/parser.rs` with a `total_len < MIN_FRAME` guard. After the fix
+the same fuzzer ran ~1.4M iterations in a container at ~175K/s with zero
+crashes.
+
 ## Docs
 
 | doc | contents |
 |---|---|
 | [Benchmarks](benchmarks/README.md) | methodology, honest RPS/latency, how to reproduce in Docker |
 | [deploy/zhensegg.service](deploy/zhensegg.service) | systemd unit: hardened, restarts, live rotation via `SIGHUP` |
+| [fuzz/](fuzz/) | protocol fuzzer + TCP soak harness; parser robustness, live SIGHUP rotation |
 
 ## Status
 
 Experimental, moving fast. The `mem` path is the throughput showcase; the
 `file` path is the durable production default and where the sharp edges are
-flushed out. Fuzzing, a public protocol spec, and CI are next.
+flushed out. The wire parser is under coverage-guided fuzzing, soak-tested
+against a live binary in a container, and hardened for rotation; a public
+protocol spec is next.
 
 ## License
 
