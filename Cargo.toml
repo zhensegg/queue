@@ -1,0 +1,41 @@
+[package]
+name = "zhensegg"
+version = "0.1.0"
+edition = "2021"
+description = "Zhensegg Queue - zero-copy offset broker with io_uring/thread-per-core"
+license = "MIT"
+
+[[bin]]
+name = "zhensegg-broker"
+path = "src/bin/broker.rs"
+
+[[bin]]
+name = "zhensegg-bench"
+path = "src/bin/bench.rs"
+
+[dependencies]
+bytes = "1.9"
+parking_lot = "0.12"
+clap = { version = "4.5", features = ["derive"] }
+tokio = { version = "1.38", features = ["full"] }
+mimalloc = { version = "0.1.43", optional = true }
+nix = { version = "0.29", features = ["fs"] }
+libc = "0.2"
+crossbeam-channel = "0.5"
+
+[dependencies.monoio]
+version = "0.2.4"
+features = ["poll-io"]
+optional = true
+
+[features]
+default = []
+mimalloc = ["dep:mimalloc"]
+uring = ["dep:monoio"]
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+panic = "abort"
+strip = true
+opt-level = 3
