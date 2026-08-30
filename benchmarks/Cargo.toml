@@ -1,0 +1,21 @@
+[package]
+name = "zhensegg-bench"
+version = "0.1.0"
+edition = "2021"
+description = "Honest production benchmark harness for the Zhensegg broker (closed-loop, producer/consumer threads)"
+
+[[bin]]
+name = "zhensegg-bench"
+path = "src/main.rs"
+
+[dependencies]
+zhensegg = { path = ".." }
+tokio = { version = "1.38", features = ["full"] }
+clap = { version = "4.5", features = ["derive"] }
+libc = "0.2"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+panic = "abort"
+opt-level = 3
