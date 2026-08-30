@@ -22,10 +22,12 @@ mimalloc = { version = "0.1.43", optional = true }
 nix = { version = "0.29", features = ["fs"] }
 libc = "0.2"
 crossbeam-channel = "0.5"
+socket2 = "0.5"
+io-uring = "0.6"
 
 [dependencies.monoio]
 version = "0.2.4"
-features = ["poll-io"]
+features = ["poll-io", "sync"]
 optional = true
 
 [features]

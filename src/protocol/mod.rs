@@ -243,6 +243,25 @@ impl Parser {
         }
     }
 
+    /// Returns raw bytes of current frame (including 4-byte len prefix) for zero-copy forward.
+    /// Must be called after try_parse() returns Some and before consume().
+    pub fn current_frame_raw(&self) -> Option<&[u8]> {
+        let avail = self.buffered();
+        if avail < LEN_PREFIX {
+            return None;
+        }
+        let total_len = u32::from_be_bytes([
+            self.buf[self.start],
+            self.buf[self.start + 1],
+            self.buf[self.start + 2],
+            self.buf[self.start + 3],
+        ]) as usize;
+        if total_len > 16 * 1024 * 1024 || avail < LEN_PREFIX + total_len {
+            return None;
+        }
+        Some(&self.buf[self.start..self.start + LEN_PREFIX + total_len])
+    }
+
     /// Convenience: parse all complete frames, calling handler for each.
     /// Handler receives FrameRef and should copy if needed.
     pub fn drain<F>(&mut self, mut f: F)

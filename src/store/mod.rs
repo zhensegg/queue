@@ -24,6 +24,30 @@ pub trait Store: Send + Sync {
     fn write_pos(&self) -> u64;
 }
 
+#[cfg(target_os = "linux")]
+fn try_register_buffers(buf: &[u8]) {
+    let _ = std::panic::catch_unwind(|| {
+        if let Ok(ring) = io_uring::IoUring::new(1) {
+            let iov = libc::iovec {
+                iov_base: buf.as_ptr() as *mut libc::c_void,
+                iov_len: buf.len(),
+            };
+            let _ = unsafe { ring.submitter().register_buffers(&[iov]) };
+        }
+    });
+}
+
+#[cfg(target_os = "linux")]
+fn try_register_file(file: &std::fs::File) {
+    use std::os::unix::io::AsRawFd;
+    let _ = std::panic::catch_unwind(|| {
+        if let Ok(ring) = io_uring::IoUring::new(1) {
+            let fd = file.as_raw_fd();
+            let _ = unsafe { ring.submitter().register_files(&[fd]) };
+        }
+    });
+}
+
 /// In-memory circular buffer. Fast path for >11M in-memory benchmark.
 /// No disk, no fsync, pure memory sequential access.
 /// Layout for each record: [4 topic_len][4 payload_len][topic][payload]
@@ -45,12 +69,36 @@ unsafe impl Send for MemRing {}
 impl MemRing {
     pub fn new(capacity: usize) -> Self {
         let cap = capacity.next_power_of_two().max(64 * 1024);
-        Self {
-            buf: std::cell::UnsafeCell::new(vec![0u8; cap]),
+        let ring = Self {
+            buf: std::cell::UnsafeCell::new(Self::alloc(cap)),
             capacity: cap,
             write_pos: AtomicU64::new(0),
             records: AtomicU64::new(0),
+        };
+        #[cfg(target_os = "linux")]
+        {
+            // best-effort register fixed buffer for io_uring to avoid per-op mmap
+            let buf_ref: &[u8] = unsafe { &*ring.buf.get() };
+            try_register_buffers(buf_ref);
         }
+        ring
+    }
+
+    #[cfg(target_os = "linux")]
+    fn alloc(cap: usize) -> Vec<u8> {
+        let mut v = vec![0u8; cap];
+        unsafe {
+            // THP: 2MB transparent huge pages (glibc mmap's large allocs -> page aligned)
+            let _ = libc::madvise(v.as_mut_ptr() as *mut libc::c_void, cap, libc::MADV_HUGEPAGE);
+            // prefault all pages + pin in RAM: no page faults on hot path
+            let _ = libc::mlock(v.as_ptr() as *const libc::c_void, cap);
+        }
+        v
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    fn alloc(cap: usize) -> Vec<u8> {
+        vec![0u8; cap]
     }
 
     pub fn with_default() -> Self {
@@ -167,6 +215,8 @@ pub mod file_ring {
                 .open(path)?;
             file.set_len(cap as u64)?;
             unsafe { libc::posix_fadvise(file.as_raw_fd(), 0, 0, libc::POSIX_FADV_SEQUENTIAL); }
+            #[cfg(target_os = "linux")]
+            try_register_file(&file);
             let inner = MemRing::new(cap);
             let file_arc = Arc::new(parking_lot::Mutex::new(file));
             let file_clone = file_arc.clone();

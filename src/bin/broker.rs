@@ -4,7 +4,89 @@ use std::sync::Arc;
 use parking_lot::RwLock;
 use zhensegg::protocol::{encode_ack, encode_data, Op, Parser as ZParser};
 
-#[derive(ClapParser, Debug)]
+// ===== provided-buffers style slab (step3): per-thread free-list, zero alloc on hot path =====
+thread_local! {
+    static BUF_POOL: std::cell::RefCell<Vec<Vec<u8>>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+fn take_buf(min: usize) -> Vec<u8> {
+    BUF_POOL.with(|p| {
+        let mut pool = p.borrow_mut();
+        // scan from end (most recently freed = hot in cache)
+        for i in (0..pool.len()).rev() {
+            if pool[i].capacity() >= min {
+                return pool.swap_remove(i);
+            }
+        }
+        Vec::with_capacity(min.max(64))
+    })
+}
+
+fn give_buf(mut b: Vec<u8>) {
+    b.clear();
+    let cap = b.capacity();
+    if cap <= 256 * 1024 {
+        BUF_POOL.with(|p| {
+            let mut pool = p.borrow_mut();
+            if pool.len() < 512 {
+                pool.push(b);
+            }
+        });
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn bind_reuse_port(addr: &str) -> std::io::Result<std::net::TcpListener> {
+    use socket2::{Domain, SockAddr, Socket, Type};
+    use std::os::unix::io::AsRawFd;
+    let std_addr: std::net::SocketAddr = addr.parse().expect("invalid addr");
+    let domain = Domain::for_address(std_addr);
+    let socket = Socket::new(domain, Type::STREAM, None)?;
+    socket.set_reuse_address(true)?;
+    // SO_REUSEPORT via libc (socket2 0.5 set_reuse_port may not be available)
+    let optval: libc::c_int = 1;
+    let ret = unsafe {
+        libc::setsockopt(
+            socket.as_raw_fd(),
+            libc::SOL_SOCKET,
+            libc::SO_REUSEPORT,
+            &optval as *const _ as *const libc::c_void,
+            std::mem::size_of_val(&optval) as libc::socklen_t,
+        )
+    };
+    if ret != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    // step7: buffers on listener (accepted sockets inherit) + busy poll best-effort
+    let bufsz: libc::c_int = 1 << 20;
+    unsafe {
+        let _ = libc::setsockopt(socket.as_raw_fd(), libc::SOL_SOCKET, libc::SO_RCVBUF, &bufsz as *const _ as *const libc::c_void, std::mem::size_of_val(&bufsz) as libc::socklen_t);
+        let _ = libc::setsockopt(socket.as_raw_fd(), libc::SOL_SOCKET, libc::SO_SNDBUF, &bufsz as *const _ as *const libc::c_void, std::mem::size_of_val(&bufsz) as libc::socklen_t);
+        let busy: libc::c_int = 50;
+        let _ = libc::setsockopt(socket.as_raw_fd(), libc::SOL_SOCKET, libc::SO_BUSY_POLL, &busy as *const _ as *const libc::c_void, std::mem::size_of_val(&busy) as libc::socklen_t);
+    }
+    socket.set_nonblocking(true)?;
+    socket.bind(&SockAddr::from(std_addr))?;
+    socket.listen(4096)?;
+    Ok(socket.into())
+}
+
+// step7: per-connection socket tuning (NODELAY, QUICKACK, buffers, busy poll)
+#[cfg(target_os = "linux")]
+fn tune_socket(fd: std::os::unix::io::RawFd) {
+    unsafe {
+        let one: libc::c_int = 1;
+        let _ = libc::setsockopt(fd, libc::IPPROTO_TCP, libc::TCP_NODELAY, &one as *const _ as *const libc::c_void, std::mem::size_of_val(&one) as libc::socklen_t);
+        let _ = libc::setsockopt(fd, libc::IPPROTO_TCP, libc::TCP_QUICKACK, &one as *const _ as *const libc::c_void, std::mem::size_of_val(&one) as libc::socklen_t);
+        let bufsz: libc::c_int = 1 << 20;
+        let _ = libc::setsockopt(fd, libc::SOL_SOCKET, libc::SO_RCVBUF, &bufsz as *const _ as *const libc::c_void, std::mem::size_of_val(&bufsz) as libc::socklen_t);
+        let _ = libc::setsockopt(fd, libc::SOL_SOCKET, libc::SO_SNDBUF, &bufsz as *const _ as *const libc::c_void, std::mem::size_of_val(&bufsz) as libc::socklen_t);
+        let busy: libc::c_int = 50;
+        let _ = libc::setsockopt(fd, libc::SOL_SOCKET, libc::SO_BUSY_POLL, &busy as *const _ as *const libc::c_void, std::mem::size_of_val(&busy) as libc::socklen_t);
+    }
+}
+
+#[derive(ClapParser, Debug, Clone)]
 #[command(name="zhensegg-broker")]
 struct Args {
     #[arg(long, default_value="0.0.0.0:9090")]
@@ -21,7 +103,44 @@ struct Args {
     ring_capacity_mb: usize,
 }
 
-type SubscriberMap = Arc<RwLock<HashMap<Vec<u8>, Vec<Arc<Subscriber>>>>>;
+type SubscriberMap = std::sync::Arc<SubMap>;
+
+// ===== step5: sharded subscriber map (FNV-1a, 64 shards) — hot path takes 1 shard read lock, no global contention =====
+struct SubMap {
+    shards: Vec<parking_lot::RwLock<HashMap<Vec<u8>, Vec<Arc<Subscriber>>>>>,
+    mask: usize,
+}
+
+impl SubMap {
+    fn new(n: usize) -> Self {
+        let n = n.next_power_of_two();
+        Self {
+            shards: (0..n).map(|_| parking_lot::RwLock::new(HashMap::new())).collect(),
+            mask: n - 1,
+        }
+    }
+
+    #[inline]
+    fn idx(&self, topic: &[u8]) -> usize {
+        // FNV-1a 64
+        let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+        for &b in topic {
+            h ^= b as u64;
+            h = h.wrapping_mul(0x0000_0100_0000_01b3);
+        }
+        (h as usize) & self.mask
+    }
+
+    #[inline]
+    fn read(&self, topic: &[u8]) -> parking_lot::RwLockReadGuard<'_, HashMap<Vec<u8>, Vec<Arc<Subscriber>>>> {
+        self.shards[self.idx(topic)].read()
+    }
+
+    #[inline]
+    fn write(&self, topic: &[u8]) -> parking_lot::RwLockWriteGuard<'_, HashMap<Vec<u8>, Vec<Arc<Subscriber>>>> {
+        self.shards[self.idx(topic)].write()
+    }
+}
 
 struct Subscriber {
     id: u64,
@@ -56,6 +175,54 @@ fn main() {
 }
 
 #[cfg(all(target_os="linux", feature="uring"))]
+type MonoioRt = monoio::Runtime<monoio::time::TimeDriver<monoio::IoUringDriver>>;
+
+#[cfg(all(target_os="linux", feature="uring"))]
+fn build_monoio_rt(cid: usize, sqpoll_cpu: Option<u32>) -> MonoioRt {
+    // attempt 1: SQPOLL (kernel poller thread, no submit syscall) + COOP_TASKRUN
+    // requires CAP_SYS_NICE or kernel.io_uring unprivileged sqpoll allowed
+    {
+        let mut urb = io_uring::IoUring::builder();
+        urb.setup_sqpoll(1000);
+        if let Some(cpu) = sqpoll_cpu {
+            urb.setup_sqpoll_cpu(cpu);
+        }
+        urb.setup_coop_taskrun().setup_single_issuer();
+        if let Ok(rt) = monoio::RuntimeBuilder::<monoio::IoUringDriver>::new()
+            .with_entries(4096)
+            .uring_builder(urb)
+            .enable_timer()
+            .build()
+        {
+            eprintln!("[rt {}] io_uring: SQPOLL+COOP_TASKRUN+SQ_AFF", cid);
+            return rt;
+        }
+    }
+    // attempt 2: COOP_TASKRUN only (no kernel poller thread)
+    {
+        let mut urb = io_uring::IoUring::builder();
+        urb.setup_coop_taskrun();
+        urb.setup_single_issuer();
+        if let Ok(rt) = monoio::RuntimeBuilder::<monoio::IoUringDriver>::new()
+            .with_entries(4096)
+            .uring_builder(urb)
+            .enable_timer()
+            .build()
+        {
+            eprintln!("[rt {}] io_uring: COOP_TASKRUN+SINGLE_ISSUER", cid);
+            return rt;
+        }
+    }
+    // attempt 3: plain io_uring
+    eprintln!("[rt {}] io_uring: default flags", cid);
+    monoio::RuntimeBuilder::<monoio::IoUringDriver>::new()
+        .with_entries(4096)
+        .enable_timer()
+        .build()
+        .expect("monoio rt")
+}
+
+#[cfg(all(target_os="linux", feature="uring"))]
 fn run_monoio_single(args: Args) {
     // shared store
     let store: Arc<dyn zhensegg::Store> = if args.mode == "file" {
@@ -66,13 +233,9 @@ fn run_monoio_single(args: Args) {
         let cap = args.mem_mb * 1024 * 1024;
         Arc::new(zhensegg::MemRing::new(cap))
     };
-    let subs: SubscriberMap = Arc::new(RwLock::new(HashMap::new()));
+    let subs: SubscriberMap = Arc::new(SubMap::new(64));
 
-    // monoio runtime single thread
-    let mut rt = monoio::RuntimeBuilder::<monoio::FusionDriver>::new()
-        .enable_timer()
-        .build()
-        .expect("monoio rt");
+    let mut rt = build_monoio_rt(0, Some(0));
     rt.block_on(async move {
         monoio_broker_loop(args.addr, store, subs).await;
     });
@@ -94,7 +257,7 @@ fn run_monoio_multicore(args: Args) {
     } else {
         Arc::new(zhensegg::MemRing::new(mem_mb*1024*1024))
     };
-    let subs: SubscriberMap = Arc::new(RwLock::new(HashMap::new()));
+    let subs: SubscriberMap = Arc::new(SubMap::new(64));
 
     let mut handles = Vec::new();
     for cid in 0..cores {
@@ -109,10 +272,7 @@ fn run_monoio_multicore(args: Args) {
                 {
                     let _ = core_affinity_attempt(cid);
                 }
-                let mut rt = monoio::RuntimeBuilder::<monoio::FusionDriver>::new()
-                    .enable_timer()
-                    .build()
-                    .expect("rt");
+                let mut rt = build_monoio_rt(cid, Some(cid as u32));
                 rt.block_on(async move {
                     println!("[core {}] listening {}", cid, addr_c);
                     monoio_broker_loop(addr_c, store_c, subs_c).await;
@@ -123,9 +283,9 @@ fn run_monoio_multicore(args: Args) {
     for h in handles { let _ = h.join(); }
 }
 
-#[cfg(all(target_os="linux", feature="uring"))]
+#[cfg(target_os = "linux")]
 fn core_affinity_attempt(core_id: usize) -> std::io::Result<()> {
-    #[cfg(all(target_os="linux", feature="uring"))]
+    #[cfg(target_os = "linux")]
     {
         use std::mem;
         unsafe {
@@ -142,9 +302,23 @@ fn core_affinity_attempt(core_id: usize) -> std::io::Result<()> {
 #[cfg(all(target_os="linux", feature="uring"))]
 async fn monoio_broker_loop(addr: String, store: Arc<dyn zhensegg::Store>, subs: SubscriberMap) {
     use monoio::net::TcpListener;
-    use monoio::io::{AsyncReadRent, AsyncWriteRentExt};
 
-    let listener = TcpListener::bind(&addr).expect("bind");
+    let listener = {
+        #[cfg(target_os = "linux")]
+        {
+            match bind_reuse_port(&addr) {
+                Ok(std_listener) => TcpListener::from_std(std_listener).expect("from_std"),
+                Err(e) => {
+                    eprintln!("[monoio] reuse_port bind failed {e}, fallback to bind");
+                    TcpListener::bind(&addr).expect("bind")
+                }
+            }
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            TcpListener::bind(&addr).expect("bind")
+        }
+    };
     println!("[monoio] listening on {}", addr);
     let mut next_id: u64 = 0;
     loop {
@@ -176,7 +350,12 @@ async fn handle_monoio_conn(
     store: Arc<dyn zhensegg::Store>,
     subs: SubscriberMap,
 ) -> std::io::Result<()> {
-    use monoio::io::{AsyncReadRent, AsyncWriteRentExt};
+    use monoio::io::{AsyncReadRent, AsyncWriteRentExt, Splitable};
+
+    // step7: socket tuning on accepted connection
+    #[cfg(target_os = "linux")]
+    tune_socket(std::os::unix::io::AsRawFd::as_raw_fd(&stream));
+    let _ = stream.set_nodelay(true);
 
     // per-connection state
     let mut parser = ZParser::new(64 * 1024);
@@ -201,93 +380,73 @@ async fn handle_monoio_conn(
 
     // For outbound batching we accumulate Vec<u8> buffers and flush via write_all once per iteration.
 
-    let mut pending_out: Vec<Vec<u8>> = Vec::new();
-
-    loop {
-        // check if there is pending fan-out data for this connection (we are subscriber)
-        while let Ok(msg) = rx.try_recv() {
-            pending_out.push(msg);
-            // batch threshold 64KB or 128 messages
-            if pending_out.len() >= 128 {
+    // split stream for per-connection concurrent read/write (true thread-per-core)
+    let (mut read_half, mut write_half) = stream.into_split();
+    // writer task: batched io_uring write
+    let mut rx_writer = rx;
+    let writer = monoio::spawn(async move {
+        let mut pending: Vec<Arc<Vec<u8>>> = Vec::with_capacity(256);
+        loop {
+            let first = rx_writer.recv().await;
+            if first.is_none() {
+                break;
+            }
+            pending.push(first.unwrap());
+            while pending.len() < 256 {
+                match rx_writer.try_recv() {
+                    Ok(m) => pending.push(m),
+                    Err(_) => break,
+                }
+            }
+            let total: usize = pending.iter().map(|v| v.len()).sum();
+            let mut out = take_buf(total);
+            for m in pending.drain(..) {
+                // recycle buffer backing if this is the last Arc holder (provided-buffers style slab)
+                if Arc::strong_count(&m) == 1 {
+                    let raw = Arc::try_unwrap(m).unwrap_or_default();
+                    out.extend_from_slice(&raw);
+                    give_buf(raw);
+                } else {
+                    out.extend_from_slice(&m);
+                }
+            }
+            let (res, ret): (std::io::Result<usize>, Vec<u8>) = monoio::io::AsyncWriteRentExt::write_all(&mut write_half, out).await;
+            give_buf(ret);
+            if res.is_err() {
                 break;
             }
         }
-        if !pending_out.is_empty() {
-            // coalesce into one write syscall (Batching concept.md:19)
-            write_buf.clear();
-            for m in pending_out.drain(..) {
-                write_buf.extend_from_slice(&m);
-            }
-            // zero-copy batched write: single write() call
-            let (res, _) = stream.write_all(write_buf).await;
-            res?;
-            write_buf = Vec::with_capacity(64*1024);
-        }
-
-        // try read with timeout to avoid blocking forever while we need to flush pending
-        // Use monoio time timeout
-        let read_fut = stream.read(read_buf);
-        let timeout = monoio::time::sleep(std::time::Duration::from_millis(1));
-        // Simple: race read vs timeout using select
-        // monoio doesn't have tokio::select, we can use futures with monoio compat? Use tokio::select via monoio-compat? Simpler: just do read with small timeout via `monoio::time::timeout`
-        let read_res = monoio::time::timeout(std::time::Duration::from_millis(2), read_fut).await;
-        let n = match read_res {
-            Ok((Ok(n), buf)) => { read_buf = buf; n },
-            Ok((Err(e), _)) => { break Err(e); },
-            Err(_) => {
-                // timeout, loop again to flush pending
-                if pending_out.is_empty() {
-                    // check if any new pending arrived after timeout
-                    continue;
-                } else {
-                    continue;
-                }
-            }
+    });
+    loop {
+        let (res, buf): (std::io::Result<usize>, Vec<u8>) = monoio::io::AsyncReadRent::read(&mut read_half, read_buf).await;
+        read_buf = buf;
+        let n = match res {
+            Ok(0) => break,
+            Ok(n) => n,
+            Err(_) => break,
         };
-        if n == 0 {
-            break Ok(());
-        }
         parser.feed(&read_buf[..n]);
 
         // drain complete frames zero-alloc
         while let Some(frame) = parser.try_parse() {
             match frame.op {
                 Op::Publish => {
-                    // copy topic/payload needed before consume (zero-alloc slice)
-                    let topic = frame.topic.to_vec();
-                    let payload = frame.payload.to_vec();
-                    let t_len = topic.len();
-                    let p_len = payload.len();
-                    // append to store -> offset
-                    let (offset, rec_len) = store.append(&topic, &payload).map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, format!("{:?}", e)))?;
-                    // ack to producer: encode ack with offset
-                    let mut ack = Vec::with_capacity(64);
-                    encode_ack(&mut ack, &topic, offset, rec_len);
-                    // batch ack with pending_out? For now immediate write
-                    let (res, _) = stream.write_all(ack).await;
-                    res?;
-
-                    // fan-out to subscribers: either NOTIFY or DATA
-                    // We send DATA for in-mem fast path, NOTIFY for offset mode subscribers.
-                    // For MVP we fan-out DATA (full payload) to all subs of topic.
-                    // To respect zero-copy concept.md:18, we reuse slice bytes without extra alloc per subscriber beyond header copy.
-                    // We encode DATA once and clone buffer for each subscriber (still one copy per fan-out, but batched).
-
-                    let subs_guard = subs.read();
-                    if let Some(list) = subs_guard.get(&topic) {
-                        // encode data frame once
-                        let mut data_frame = Vec::with_capacity(13 + t_len + p_len);
-                        encode_data(&mut data_frame, &topic, &payload);
-                        // also encode notify variant (offset) for offset-mode? We'll send data for now.
-                        // Clone for each subscriber via channel (avoids holding lock while writing)
-                        for sub in list.iter() {
-                            if sub.id == id {
-                                // optionally skip self? but publish may also be subscriber; deliver anyway
+                    let topic_slice = frame.topic;
+                    let payload_slice = frame.payload;
+                    let (offset, rec_len) = store.append(topic_slice, payload_slice).map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, format!("{:?}", e)))?;
+                    let mut ack = take_buf(32);
+                    encode_ack(&mut ack, topic_slice, offset, rec_len);
+                    let _ = tx.send(Arc::new(ack));
+                    let subs_guard = subs.read(topic_slice);
+                    if let Some(list) = subs_guard.get(topic_slice) {
+                        if !list.is_empty() {
+                            let mut data = take_buf(13 + topic_slice.len() + payload_slice.len());
+                            encode_data(&mut data, topic_slice, payload_slice);
+                            let arc = Arc::new(data);
+                            for sub in list.iter() {
+                                let _ = sub.tx.send(arc.clone());
                             }
-                            let _ = sub.tx.send(data_frame.clone());
                         }
-                    } else {
-                        // Also check wildcard? MVP exact match only
                     }
                     // Also try NOTIFY path for offset subscribers: if we had separate list, but for now same.
 
@@ -295,53 +454,40 @@ async fn handle_monoio_conn(
                 }
                 Op::Subscribe => {
                     let topic = frame.topic.to_vec();
-                    // register this connection as subscriber for topic
                     let sub = Arc::new(Subscriber { id, tx: tx.clone() });
                     {
-                        let mut g = subs.write();
+                        let mut g = subs.write(&topic);
                         g.entry(topic.clone()).or_default().push(sub);
                     }
                     my_topics.push(topic.clone());
-                    // optional ack subscribe
-                    let mut ack = Vec::with_capacity(32);
-                    // we reuse Ack with offset 0 as subscribe ack
+                    let mut ack = take_buf(32);
                     encode_ack(&mut ack, &topic, 0, 0);
-                    let (res, _) = stream.write_all(ack).await;
-                    res?;
+                    let _ = tx.send(Arc::new(ack));
                 }
                 Op::Fetch => {
-                    // payload contains offset+len, topic as key
                     if frame.payload.len() >= 12 {
                         let off = u64::from_be_bytes(frame.payload[0..8].try_into().unwrap());
                         let len = u32::from_be_bytes(frame.payload[8..12].try_into().unwrap());
                         let topic = frame.topic.to_vec();
-                        let mut out = Vec::with_capacity(len as usize + 32);
-                        // read from store
                         let mut raw = Vec::new();
                         match store.read(off, len, &mut raw) {
                             Ok(()) => {
-                                // raw contains [4 topic_len][4 payload_len][topic][payload]
-                                // decode to extract payload slice
                                 if raw.len() >= 8 {
                                     let tl = u32::from_be_bytes([raw[0], raw[1], raw[2], raw[3]]) as usize;
                                     let pl = u32::from_be_bytes([raw[4], raw[5], raw[6], raw[7]]) as usize;
                                     if raw.len() >= 8+tl+pl {
                                         let stored_topic = &raw[8..8+tl];
                                         let stored_payload = &raw[8+tl..8+tl+pl];
-                                        // send DATA frame containing fetched payload
                                         let mut data = Vec::with_capacity(13+stored_topic.len()+stored_payload.len());
                                         encode_data(&mut data, stored_topic, stored_payload);
-                                        let (res, _) = stream.write_all(data).await;
-                                        res?;
+                                        let _ = tx.send(Arc::new(data));
                                     }
                                 }
                             }
-                            Err(e) => {
-                                // send error ack
+                            Err(_) => {
                                 let mut err = Vec::new();
                                 encode_ack(&mut err, &topic, 0, 0);
-                                let (res, _) = stream.write_all(err).await;
-                                res?;
+                                let _ = tx.send(Arc::new(err));
                             }
                         }
                     }
@@ -349,37 +495,112 @@ async fn handle_monoio_conn(
                 Op::Ping => {
                     let mut pong = Vec::new();
                     encode_ack(&mut pong, b"pong", 0, 0);
-                    let (res, _) = stream.write_all(pong).await;
-                    res?;
+                    let _ = tx.send(Arc::new(pong));
                 }
                 _ => {}
             }
             parser.consume();
         }
     }
-    // cleanup subscriptions
-    {
-        let mut g = subs.write();
-        for t in my_topics {
-            if let Some(list) = g.get_mut(&t) {
-                list.retain(|s| s.id != id);
-                if list.is_empty() { g.remove(&t); }
-            }
+    drop(tx);
+    let _ = writer.await;
+    // cleanup subscriptions (per-topic shard lock)
+    for t in my_topics {
+        let mut g = subs.write(&t);
+        if let Some(list) = g.get_mut(&t) {
+            list.retain(|s| s.id != id);
+            if list.is_empty() { g.remove(&t); }
         }
     }
     let _ = Ok::<(), std::io::Error>(());
     Ok(())
 }
 
-// Fallback tokio implementation for Windows / non-linux
+// Fallback tokio with optional per-core SO_REUSEPORT sharding
 fn run_tokio_fallback(args: Args) {
-    let rt = tokio::runtime::Builder::new_multi_thread()
-        .enable_all()
-        .worker_threads(args.cores)
-        .build().expect("tokio rt");
-    rt.block_on(async move {
-        tokio_broker_loop(args).await;
-    });
+    if args.cores <= 1 {
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .worker_threads(1)
+            .build()
+            .expect("tokio rt");
+        rt.block_on(async move {
+            tokio_broker_loop(args).await;
+        });
+    } else {
+        // per-core sharding with SO_REUSEPORT (concept linear scalability)
+        let cores = args.cores;
+        let store: Arc<dyn zhensegg::Store> = if args.mode == "file" {
+            let cap = args.ring_capacity_mb * 1024 * 1024;
+            let fr = zhensegg::FileRing::new(&args.file, cap).expect("file ring");
+            Arc::new(fr)
+        } else {
+            let cap = args.mem_mb * 1024 * 1024;
+            Arc::new(zhensegg::MemRing::new(cap))
+        };
+        let subs: SubscriberMap = Arc::new(SubMap::new(64));
+        let mut handles = Vec::new();
+        for cid in 0..cores {
+            let addr_c = args.addr.clone();
+            let store_c = store.clone();
+            let subs_c = subs.clone();
+            let mode_c = args.mode.clone();
+            let h = std::thread::Builder::new()
+                .name(format!("tokio-{}", cid))
+                .spawn(move || {
+                    #[cfg(target_os = "linux")]
+                    let _ = core_affinity_attempt(cid);
+                    let rt = tokio::runtime::Builder::new_current_thread()
+                        .enable_all()
+                        .build()
+                        .expect("tokio rt current_thread");
+                    rt.block_on(async move {
+                        println!("[tokio core {}] listening {} mode={} (reuse_port)", cid, addr_c, mode_c);
+                        tokio_broker_loop_shared(addr_c, store_c, subs_c).await;
+                    });
+                })
+                .expect("spawn");
+            handles.push(h);
+        }
+        for h in handles {
+            let _ = h.join();
+        }
+    }
+}
+
+async fn tokio_broker_loop_shared(addr: String, store: Arc<dyn zhensegg::Store>, subs: SubscriberMap) {
+    use tokio::net::TcpListener;
+    let listener = {
+        #[cfg(target_os = "linux")]
+        {
+            match bind_reuse_port(&addr) {
+                Ok(std_listener) => TcpListener::from_std(std_listener).expect("from_std"),
+                Err(e) => {
+                    eprintln!("[tokio] reuse_port bind failed {e}, fallback to bind");
+                    TcpListener::bind(&addr).await.expect("bind tokio")
+                }
+            }
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            TcpListener::bind(&addr).await.expect("bind tokio")
+        }
+    };
+    let mut next_id: u64 = 0;
+    loop {
+        match listener.accept().await {
+            Ok((socket, _)) => {
+                next_id += 1;
+                let id = next_id;
+                let store_c = store.clone();
+                let subs_c = subs.clone();
+                tokio::spawn(async move {
+                    if let Err(_e) = handle_tokio_conn(socket, id, store_c, subs_c).await {}
+                });
+            }
+            Err(e) => eprintln!("accept err {:?}", e),
+        }
+    }
 }
 
 async fn tokio_broker_loop(args: Args) {
@@ -394,9 +615,24 @@ async fn tokio_broker_loop(args: Args) {
         let cap = args.mem_mb * 1024 * 1024;
         Arc::new(zhensegg::MemRing::new(cap))
     };
-    let subs: SubscriberMap = Arc::new(RwLock::new(HashMap::new()));
-    let listener = TcpListener::bind(&args.addr).await.expect("bind tokio");
-    println!("[tokio] listening {} mode={} (fallback, perf lower than monoio io_uring)", args.addr, args.mode);
+    let subs: SubscriberMap = Arc::new(SubMap::new(64));
+    let listener = {
+        #[cfg(target_os = "linux")]
+        {
+            match bind_reuse_port(&args.addr) {
+                Ok(std_listener) => TcpListener::from_std(std_listener).expect("from_std"),
+                Err(e) => {
+                    eprintln!("[tokio] reuse_port bind failed {e}, fallback to bind");
+                    TcpListener::bind(&args.addr).await.expect("bind tokio")
+                }
+            }
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            TcpListener::bind(&args.addr).await.expect("bind tokio")
+        }
+    };
+    println!("[tokio] listening {} mode={} (reuse_port, fallback lower than monoio io_uring)", args.addr, args.mode);
     let mut next_id: u64 = 0;
     loop {
         match listener.accept().await {
@@ -469,20 +705,17 @@ async fn handle_tokio_conn(
             while let Some(frame) = parser.try_parse() {
                 match frame.op {
                     Op::Publish => {
-                        let topic = frame.topic.to_vec();
-                        let payload = frame.payload.to_vec();
-                        let (offset, rec_len) = store.append(&topic, &payload).map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, format!("{:?}", e)))?;
-                        // ack to producer via writer channel (batched)
+                        let topic_slice = frame.topic;
+                        let payload_slice = frame.payload;
+                        let (offset, rec_len) = store.append(topic_slice, payload_slice).map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, format!("{:?}", e)))?;
                         let mut ack = Vec::with_capacity(32);
-                        encode_ack(&mut ack, &topic, offset, rec_len);
+                        encode_ack(&mut ack, topic_slice, offset, rec_len);
                         let _ = tx.send(Arc::new(ack));
-
-                        // fan-out to subscribers: single encode + Arc clone per subscriber (zero alloc per sub beyond refcount)
-                        let guard = subs.read();
-                        if let Some(list) = guard.get(&topic) {
+                        let guard = subs.read(topic_slice);
+                        if let Some(list) = guard.get(topic_slice) {
                             if !list.is_empty() {
-                                let mut data = Vec::with_capacity(13 + topic.len() + payload.len());
-                                encode_data(&mut data, &topic, &payload);
+                                let mut data = Vec::with_capacity(13 + topic_slice.len() + payload_slice.len());
+                                encode_data(&mut data, topic_slice, payload_slice);
                                 let arc = Arc::new(data);
                                 for sub in list.iter() {
                                     let _ = sub.tx.send(arc.clone());
@@ -494,7 +727,7 @@ async fn handle_tokio_conn(
                         let topic = frame.topic.to_vec();
                         let sub = Arc::new(Subscriber { id, tx: tx.clone() });
                         {
-                            let mut g = subs.write();
+                            let mut g = subs.write(&topic);
                             g.entry(topic.clone()).or_default().push(sub);
                         }
                         my_topics.push(topic.clone());
@@ -533,15 +766,13 @@ async fn handle_tokio_conn(
     }
     .await;
 
-    // cleanup subscriptions
-    {
-        let mut g = subs.write();
-        for t in my_topics {
-            if let Some(list) = g.get_mut(&t) {
-                list.retain(|s| s.id != id);
-                if list.is_empty() {
-                    g.remove(&t);
-                }
+    // cleanup subscriptions (per-topic shard lock)
+    for t in my_topics {
+        let mut g = subs.write(&t);
+        if let Some(list) = g.get_mut(&t) {
+            list.retain(|s| s.id != id);
+            if list.is_empty() {
+                g.remove(&t);
             }
         }
     }
