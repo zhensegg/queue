@@ -1,0 +1,71 @@
+# zhensegg.service — Zhensegg Queue broker (offset message bus)
+#
+# Install:
+#   cp deploy/zhensegg.service /etc/systemd/system/zhensegg.service
+#   systemctl daemon-reload && systemctl enable --now zhensegg
+#
+# Secret rotation without a restart:
+#   # 1. write the new token to the token files, swap in a new cert/key
+#   #    (atomic rename onto the configured paths), then:
+#   systemctl kill -s HUP zhensegg      # reloads --auth-token-file / TLS cert+key
+#
+# Probes:
+#   ExecStartPre ensures the data ring is present; /health + /ready on the
+#   admin port answer 200 only when the broker is healthy.
+
+[Unit]
+Description=Zhensegg Queue broker
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=simple
+User=zhensegg
+Group=zhensegg
+ExecStart=/usr/local/bin/zhensegg-broker \
+    --addr 0.0.0.0:9090 \
+    --http-addr 127.0.0.1:9091 \
+    --http-loopback-only \
+    --mode file \
+    --file /var/lib/zhensegg/ring.dat \
+    --ring-capacity-mb 4096 \
+    --cores 4 \
+    --auth-token-file /etc/zhensegg/auth.token \
+    --http-auth-token-file /etc/zhensegg/http-auth.token \
+    --tls-cert /etc/zhensegg/tls/server.crt \
+    --tls-key /etc/zhensegg/tls/server.key \
+    --max-connections 8192 \
+    --auth-timeout-secs 10
+ExecStartPre=/usr/bin/mkdir -p /var/lib/zhensegg /run/zhensegg
+ExecStartPre=/usr/bin/chown -R zhensegg:zhensegg /var/lib/zhensegg /run/zhensegg
+Restart=on-failure
+RestartSec=2
+LimitNOFILE=1048576
+StateDirectory=zhensegg
+RuntimeDirectory=zhensegg
+
+# Timeouts
+TimeoutStartSec=30
+TimeoutStopSec=30
+
+# Performance
+CPUAffinity=0-3
+OOMScoreAdjust=-100
+
+# Logging
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=zhensegg
+
+# Security hardening
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+ReadWritePaths=/var/lib/zhensegg /run/zhensegg
+
+[Install]
+WantedBy=multi-user.target

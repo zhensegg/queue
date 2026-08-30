@@ -7,6 +7,7 @@
 //! handoff happen once, up front, and never touch the steady-state hot loop.
 
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use tracing::debug;
 
@@ -48,7 +49,8 @@ fn give_buf(mut b: Vec<u8>) {
 }
 
 /// Handle one plain (non-TLS) tokio connection. Uses `into_split` owned halves
-/// for the zero-overhead hot path.
+/// for the zero-overhead hot path. `auth_timeout` bounds how long a connection
+/// may stay unauthenticated before it is dropped (None = unlimited).
 pub async fn handle_tokio_conn(
     stream: tokio::net::TcpStream,
     id: u64,
@@ -56,13 +58,15 @@ pub async fn handle_tokio_conn(
     subs: SubscriberMap,
     metrics: Arc<Metrics>,
     auth: AccessControl,
+    auth_timeout: Option<Duration>,
 ) -> std::io::Result<()> {
     let (read_half, write_half) = stream.into_split();
-    conn_core(read_half, write_half, id, store, subs, metrics, auth).await
+    conn_core(read_half, write_half, id, store, subs, metrics, auth, auth_timeout).await
 }
 
 /// Handle one TLS-terminated tokio connection (already handshaken by the accept
 /// loop). `tokio::io::split` is used because `TlsStream` has no owned halfs.
+/// `auth_timeout` bounds how long a connection may stay unauthenticated.
 pub async fn handle_tls_conn(
     stream: tokio_rustls::server::TlsStream<tokio::net::TcpStream>,
     id: u64,
@@ -70,12 +74,14 @@ pub async fn handle_tls_conn(
     subs: SubscriberMap,
     metrics: Arc<Metrics>,
     auth: AccessControl,
+    auth_timeout: Option<Duration>,
 ) -> std::io::Result<()> {
     let (read_half, write_half) = tokio::io::split(stream);
-    conn_core(read_half, write_half, id, store, subs, metrics, auth).await
+    conn_core(read_half, write_half, id, store, subs, metrics, auth, auth_timeout).await
 }
 
 /// Core connection driver, generic over the transport halves.
+#[allow(clippy::too_many_arguments)]
 pub async fn conn_core<R, W>(
     mut read_half: R,
     mut write_half: W,
@@ -84,6 +90,7 @@ pub async fn conn_core<R, W>(
     subs: SubscriberMap,
     metrics: Arc<Metrics>,
     auth: AccessControl,
+    auth_timeout: Option<Duration>,
 ) -> std::io::Result<()>
 where
     R: tokio::io::AsyncRead + Unpin + Send + 'static,
@@ -141,10 +148,39 @@ where
     let mut parser = ZParser::new(64 * 1024);
     let mut read_buf = vec![0u8; 64 * 1024];
     let mut my_topics: Vec<Vec<u8>> = Vec::new();
+    let auth_deadline = auth_timeout.map(|d| Instant::now() + d);
 
     let res: std::io::Result<()> = async {
         loop {
-            let n = read_half.read(&mut read_buf).await?;
+            let n = if !authenticated {
+                if let Some(deadline) = auth_deadline {
+                    let now = Instant::now();
+                    if now >= deadline {
+                        metrics.auth_failures_total.inc();
+                        return Err(std::io::Error::new(
+                            std::io::ErrorKind::TimedOut,
+                            "authentication timeout",
+                        ));
+                    }
+                    // Bound the read itself so a silent client cannot stall the
+                    // auth phase forever.
+                    match tokio::time::timeout(deadline - now, read_half.read(&mut read_buf)).await {
+                        Ok(Ok(n)) => n,
+                        Ok(Err(e)) => return Err(e),
+                        Err(_) => {
+                            metrics.auth_failures_total.inc();
+                            return Err(std::io::Error::new(
+                                std::io::ErrorKind::TimedOut,
+                                "authentication timeout",
+                            ));
+                        }
+                    }
+                } else {
+                    read_half.read(&mut read_buf).await?
+                }
+            } else {
+                read_half.read(&mut read_buf).await?
+            };
             if n == 0 {
                 break Ok(());
             }
@@ -198,8 +234,7 @@ where
                         metrics.messages_bytes_total.with_label_values(&["acked"]).inc_by(payload_slice.len() as f64);
 
                         let guard = subs.read(topic_slice);
-                        if let Some(list) = guard.get(topic_slice) {
-                            if !list.is_empty() {
+                            if let Some(list) = guard.get(topic_slice).filter(|l| !l.is_empty()) {
                                 let mut data = Vec::with_capacity(13 + topic_slice.len() + payload_slice.len());
                                 encode_data(&mut data, topic_slice, payload_slice);
                                 let arc = Arc::new(data);
@@ -209,7 +244,6 @@ where
                                     metrics.messages_bytes_total.with_label_values(&["delivered"]).inc_by(payload_slice.len() as f64);
                                 }
                             }
-                        }
                         debug!(connection_id = id, topic = %String::from_utf8_lossy(topic_slice), offset, "published");
                     }
                     Op::Subscribe => {

@@ -23,9 +23,10 @@ pub fn secure_eq(a: &[u8], b: &[u8]) -> bool {
 }
 
 /// Access policy for the broker data plane.
-#[derive(Clone)]
+#[derive(Clone, Default)]
 pub enum AccessControl {
     /// No authentication required — plain open access.
+    #[default]
     Open,
     /// The client must present this shared token as its first frame.
     Token(Arc<[u8]>),

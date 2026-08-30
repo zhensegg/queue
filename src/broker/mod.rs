@@ -3,7 +3,7 @@
 
 mod accept;
 pub mod connection;
-mod http;
+pub mod http;
 mod listener;
 mod run;
 

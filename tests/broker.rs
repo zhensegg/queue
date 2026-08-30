@@ -115,7 +115,7 @@ impl Harness {
                 let metrics = metrics.clone();
                 let auth = auth.clone();
                 tokio::spawn(async move {
-                    let _ = handle_tokio_conn(stream, i as u64 + 1, store, subs, metrics, auth).await;
+                    let _ = handle_tokio_conn(stream, i as u64 + 1, store, subs, metrics, auth, None).await;
                 });
             }
         })

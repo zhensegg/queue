@@ -12,7 +12,7 @@ use super::listener;
 use crate::config::Config;
 use crate::health::HealthState;
 use crate::metrics::Metrics;
-use crate::security::{AccessControl, build_tls_acceptor};
+use crate::security::SharedSecurity;
 use crate::store::{FileRing, MemRing, Store};
 use crate::subscription::{SubMap, SubscriberMap};
 
@@ -52,60 +52,82 @@ pub fn run_broker(config: Config) -> anyhow::Result<()> {
         durable_pos: durable_pos_atomic.clone(),
     };
 
+    // Reloadable transport security (TLS + auth tokens), shared by the accept
+    // loops and the HTTP admin server so a SIGHUP rotation applies to both.
+    let sec = Arc::new(SharedSecurity::from_config(&config)?);
+    info!(
+        tls = sec.snapshot().0.is_some(),
+        auth = !sec.snapshot().1.initially_authenticated(),
+        http_auth = sec.http_token().is_some(),
+        "security context initialized"
+    );
+
     // HTTP sidecar (non-blocking, separate thread + runtime)
     {
         let http_config = config.clone();
+        let sec = sec.clone();
         std::thread::spawn(move || {
             let rt = tokio::runtime::Builder::new_current_thread()
                 .enable_all()
                 .build()
                 .expect("http runtime");
-            rt.block_on(metrics_http_server(http_config, health_state));
+            rt.block_on(metrics_http_server(http_config, health_state, sec));
         });
     }
 
-    // Graceful shutdown flag + signal handler
+    // Graceful shutdown flag + signal handler (SIGTERM/SIGINT/ctrl-C drain, plus
+    // SIGHUP on unix to reload TLS certs and auth tokens without restart).
     let shutting_down = Arc::new(AtomicBool::new(false));
     {
         let shutting_down = shutting_down.clone();
+        let _sec = sec.clone();
+        let _cfg = config.clone();
         std::thread::spawn(move || {
             let rt = tokio::runtime::Builder::new_current_thread()
                 .enable_all()
                 .build()
                 .expect("signal runtime");
             rt.block_on(async move {
-                wait_for_shutdown_signal().await;
-                info!("shutdown signal received, draining");
-                shutting_down.store(true, Ordering::SeqCst);
+                #[cfg(unix)]
+                {
+                    use tokio::signal::unix::{SignalKind, signal};
+                    let mut hup = signal(SignalKind::hangup()).expect("sighup");
+                    tokio::pin!(hup);
+                    loop {
+                        tokio::select! {
+                            _ = hup.recv() => {
+                                match _sec.reload(&_cfg) {
+                                    Ok(()) => info!("SIGHUP: TLS/auth rotated"),
+                                    Err(e) => {
+                                        use tracing::error;
+                                        error!(error = %e, "SIGHUP reload failed, keeping previous context");
+                                    }
+                                }
+                            }
+                            _ = wait_for_shutdown_signal() => {
+                                info!("shutdown signal received, draining");
+                                shutting_down.store(true, Ordering::SeqCst);
+                                break;
+                            }
+                        }
+                    }
+                }
+                #[cfg(not(unix))]
+                {
+                    wait_for_shutdown_signal().await;
+                    info!("shutdown signal received, draining");
+                    shutting_down.store(true, Ordering::SeqCst);
+                }
             });
         });
     }
 
-    // TLS: if cert+key are configured, terminate TLS on the data plane.
-    let tls: Option<tokio_rustls::TlsAcceptor> = match (&config.tls_cert, &config.tls_key) {
-        (Some(cert), Some(key)) => {
-            info!(cert = %cert, "TLS enabled");
-            Some(build_tls_acceptor(cert, key)?)
-        }
-        (None, None) => None,
-        _ => anyhow::bail!("--tls-cert and --tls-key must be provided together"),
-    };
-
-    // Auth: a shared token makes the data plane require an Auth frame first.
-    let auth = match &config.auth_token {
-        Some(t) => {
-            info!("auth enabled (shared token)");
-            AccessControl::token(t.as_bytes())
-        }
-        None => AccessControl::open(),
-    };
-
     // Start the accept loop(s)
     let broker_store = store.clone();
     if config.cores > 1 {
-        run_multicore(&config, broker_store, subs, metrics, shutting_down.clone(), tls, auth)?;
+        run_multicore(&config, broker_store, subs, metrics, shutting_down.clone(), sec.clone())?;
     } else {
-        run_singlecore(&config, broker_store, subs, metrics, shutting_down.clone(), tls, auth)?;
+        run_singlecore(&config, broker_store, subs, metrics, shutting_down.clone(), sec.clone())?;
     }
 
     // Graceful drain: give connections time to flush pending writes
@@ -143,8 +165,7 @@ pub fn run_singlecore(
     subs: SubscriberMap,
     metrics: Arc<Metrics>,
     shutting_down: Arc<AtomicBool>,
-    tls: Option<tokio_rustls::TlsAcceptor>,
-    auth: AccessControl,
+    sec: Arc<SharedSecurity>,
 ) -> anyhow::Result<()> {
     let addr = config.addr.clone();
     let rt = tokio::runtime::Builder::new_multi_thread()
@@ -155,7 +176,7 @@ pub fn run_singlecore(
     rt.block_on(async move {
         let listener = listener::bind_listener(&addr).await?;
         info!(%addr, "listening (single core)");
-        accept_loop(listener, store, subs, metrics, shutting_down, tls, auth).await
+        accept_loop(listener, store, subs, metrics, shutting_down, sec, config).await
     })
 }
 
@@ -166,8 +187,7 @@ pub fn run_multicore(
     subs: SubscriberMap,
     metrics: Arc<Metrics>,
     shutting_down: Arc<AtomicBool>,
-    tls: Option<tokio_rustls::TlsAcceptor>,
-    auth: AccessControl,
+    sec: Arc<SharedSecurity>,
 ) -> anyhow::Result<()> {
     let addr = config.addr.clone();
     let mut handles = Vec::new();
@@ -177,8 +197,8 @@ pub fn run_multicore(
         let subs_c = subs.clone();
         let metrics_c = metrics.clone();
         let shutting_down_c = shutting_down.clone();
-        let tls_c = tls.clone();
-        let auth_c = auth.clone();
+        let sec_c = sec.clone();
+        let cfg_c = config.clone();
         let handle = std::thread::Builder::new()
             .name(format!("zhensegg-{cid}"))
             .spawn(move || {
@@ -191,7 +211,7 @@ pub fn run_multicore(
                 rt.block_on(async move {
                     let listener = listener::bind_listener(&addr_c).await.unwrap();
                     info!(cid, addr = %addr_c, "listening (core)");
-                    let _ = accept_loop(listener, store_c, subs_c, metrics_c, shutting_down_c, tls_c, auth_c).await;
+                    let _ = accept_loop(listener, store_c, subs_c, metrics_c, shutting_down_c, sec_c, &cfg_c).await;
                 });
             })
             .expect("spawn core");

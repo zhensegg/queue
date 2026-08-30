@@ -89,7 +89,7 @@ async fn tls_handshake_and_auth_publish_roundtrip() {
     let server = tokio::spawn(async move {
         let (socket, _) = listener.accept().await.unwrap();
         let tls_stream = acceptor.accept(socket).await.expect("server tls handshake");
-        let _ = handle_tls_conn(tls_stream, 1, store, subs, metrics, auth).await;
+        let _ = handle_tls_conn(tls_stream, 1, store, subs, metrics, auth, None).await;
     });
 
     // Client side: trust the self-signed cert as its own root.
