@@ -6,6 +6,27 @@ use tokio::net::TcpStream;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use zhensegg::protocol::{encode_publish, encode_subscribe, Op, Parser as ZParser};
 
+#[cfg(target_os = "linux")]
+fn tune_socket(fd: std::os::unix::io::RawFd) {
+    unsafe {
+        let one: libc::c_int = 1;
+        let _ = libc::setsockopt(fd, libc::IPPROTO_TCP, libc::TCP_NODELAY, &one as *const _ as *const libc::c_void, std::mem::size_of_val(&one) as libc::socklen_t);
+        let _ = libc::setsockopt(fd, libc::IPPROTO_TCP, libc::TCP_QUICKACK, &one as *const _ as *const libc::c_void, std::mem::size_of_val(&one) as libc::socklen_t);
+        let bufsz: libc::c_int = 1 << 20;
+        let _ = libc::setsockopt(fd, libc::SOL_SOCKET, libc::SO_RCVBUF, &bufsz as *const _ as *const libc::c_void, std::mem::size_of_val(&bufsz) as libc::socklen_t);
+        let _ = libc::setsockopt(fd, libc::SOL_SOCKET, libc::SO_SNDBUF, &bufsz as *const _ as *const libc::c_void, std::mem::size_of_val(&bufsz) as libc::socklen_t);
+        let busy: libc::c_int = 50;
+        let _ = libc::setsockopt(fd, libc::SOL_SOCKET, libc::SO_BUSY_POLL, &busy as *const _ as *const libc::c_void, std::mem::size_of_val(&busy) as libc::socklen_t);
+    }
+}
+
+async fn tune(stream: &TcpStream) {
+    #[cfg(target_os = "linux")]
+    tune_socket(std::os::unix::io::AsRawFd::as_raw_fd(stream));
+    #[cfg(not(target_os = "linux"))]
+    let _ = stream;
+}
+
 #[derive(Parser, Debug)]
 #[command(name="zhensegg-bench")]
 struct Args {
@@ -167,7 +188,7 @@ async fn producer_task(
 ) -> std::io::Result<()> {
     let mut stream = TcpStream::connect(&addr).await?;
     stream.set_nodelay(true)?;
-    // optional: increase socket buffers
+    tune(&stream).await;
     // payload pattern
     let payload = vec![b'x'; payload_size];
     let topic_bytes = topic.as_bytes();
@@ -264,6 +285,7 @@ async fn consumer_task(
 ) -> std::io::Result<()> {
     let mut stream = TcpStream::connect(&addr).await?;
     stream.set_nodelay(true)?;
+    tune(&stream).await;
     // subscribe
     let mut sub_buf = Vec::new();
     encode_subscribe(&mut sub_buf, topic.as_bytes());
