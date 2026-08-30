@@ -1,5 +1,3 @@
-//! Health check types.
-
 mod http;
 
 use serde::Serialize;

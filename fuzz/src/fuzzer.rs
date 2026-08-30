@@ -1,17 +1,3 @@
-//! Coverage-guided mutation fuzzer for the Zhensegg wire protocol parser.
-//!
-//! Runs in-process against the *real* `zhensegg::protocol::Parser` — the
-//! zero-copy, `unsafe`-containing entry point every other protocol path feeds
-//! from — plus a lightweight structural "trace" (the set of `(op, topic_len,
-//! payload_len, boundary)` tuples the parser produced) used as a coverage
-//! signal: inputs that produce a fresh trace tuple are kept in the corpus so
-//! the mutator spends its budget exploring new parser behaviour instead of
-//! rediscovering the same prefixes.
-//!
-//! Any panic inside the parser unwinds to us; we catch it, dump the failing
-//! byte-string to the crash directory, and exit non-zero so a supervisor
-//! immediately sees a defect.
-
 use std::collections::HashSet;
 use std::fs;
 use std::path::Path;
@@ -21,8 +7,6 @@ use zhensegg::protocol::Parser;
 
 use crate::proto;
 
-/// A per-input structural signature. We don't need full edge coverage; a cheap
-/// tuple that distinguishes real parser outcomes is enough to guide mutation.
 struct Sig {
     parts: Vec<(u8, u32, u32)>,
 }
@@ -41,8 +25,7 @@ fn sig_of(buf: &[u8]) -> Sig {
     let mut parser = Parser::new(64 * 1024);
     let mut parts = Vec::new();
     parser.feed(buf);
-    // `drain` runs try_parse + consume until no complete frame remains, which
-    // is exactly how the connection loop consumes a read buffer.
+    
     parser.drain(|f| {
         parts.push((
             f.op as u8,
@@ -53,15 +36,11 @@ fn sig_of(buf: &[u8]) -> Sig {
     Sig { parts }
 }
 
-/// Catch-unwind wrapper. Parsing that panics should never happen; if it does
-/// we surface it as a crash rather than let the fuzzer keep going.
 fn exercise(buf: &[u8]) -> Result<Sig, String> {
     let s = std::panic::catch_unwind(|| sig_of(buf)).map_err(|_| "parser panicked")?;
     Ok(s)
 }
 
-/// One pass of the core loop: take `input`, mutate it, exercise, and decide
-/// whether to promote the mutated copy back into the corpus.
 pub fn mutate_and_run(
     input: &[u8],
     seen: &mut HashSet<String>,
@@ -71,7 +50,7 @@ pub fn mutate_and_run(
     mutate(&mut candidate);
     let sig = exercise(&candidate)?;
     if seen.insert(sig.key()) {
-        // New coverage -> keep the mutation.
+        
         *budget = budget.saturating_sub(1);
         Ok(candidate)
     } else {
@@ -80,32 +59,31 @@ pub fn mutate_and_run(
     }
 }
 
-/// Apply a random mutation to `buf`.
 pub fn mutate(buf: &mut Vec<u8>) {
     use rand::Rng;
     let mut rng = rand::thread_rng();
     match rng.gen_range(0..6u32) {
         0 => {
-            // Bit flip somewhere.
+            
             if !buf.is_empty() {
                 let i = rng.gen_range(0..buf.len());
                 buf[i] ^= 1 << rng.gen_range(0..8);
             }
         }
         1 => {
-            // Inject a random byte at a random position (shifts lengths).
+            
             let i = rng.gen_range(0..=buf.len());
             buf.insert(i, rng.gen());
         }
         2 => {
-            // Delete a random byte (shifts lengths).
+            
             if !buf.is_empty() {
                 let i = rng.gen_range(0..buf.len());
                 buf.remove(i);
             }
         }
         3 => {
-            // Overwrite a length field (in the first 13 bytes when possible).
+            
             if buf.len() >= 4 {
                 let base = rng.gen_range(0..buf.len().min(13)).min(buf.len() - 4);
                 let v: u32 = match rng.gen_range(0..5) {
@@ -119,7 +97,7 @@ pub fn mutate(buf: &mut Vec<u8>) {
             }
         }
         4 => {
-            // Duplicate a random chunk.
+            
             if !buf.is_empty() {
                 let i = rng.gen_range(0..buf.len());
                 let n = rng.gen_range(1..=buf.len().saturating_sub(i).max(1));
@@ -134,7 +112,7 @@ pub fn mutate(buf: &mut Vec<u8>) {
             }
         }
         _ => {
-            // Append a fully fresh, valid frame (keeps reaching dispatch).
+            
             let mut rng2 = rand::thread_rng();
             proto::push_frame(buf, &mut rng2);
         }
@@ -148,8 +126,6 @@ pub struct Stats {
     pub rate: f64,
 }
 
-/// Run a fixed budget of mutation iterations (no wall-clock bound). Used by the
-/// bounded CI fixture so a fuzz pass has a deterministic iteration count.
 pub fn run_bounded(
     seed_corpus: Vec<Vec<u8>>,
     corpus_dir: &Path,
@@ -159,8 +135,6 @@ pub fn run_bounded(
     run(seed_corpus, corpus_dir, crash_dir, u64::MAX, max_iters)
 }
 
-/// Run the fuzzer for `seconds` OR `max_iters` iterations, whichever comes
-/// first, starting from the seed corpus plus any seeds under `corpus_dir`.
 pub fn run(
     seed_corpus: Vec<Vec<u8>>,
     corpus_dir: &Path,
@@ -170,7 +144,7 @@ pub fn run(
 ) -> Result<Stats, String> {
     let base_seeds = seed_corpus.clone();
     let mut corpus = seed_corpus;
-    // Load any persisted seeds from the corpus dir.
+    
     if corpus_dir.is_dir() {
         if let Ok(rd) = fs::read_dir(corpus_dir) {
             for ent in rd.flatten() {
@@ -189,7 +163,7 @@ pub fn run(
     let _ = fs::create_dir_all(crash_dir);
 
     let mut seen: HashSet<String> = HashSet::new();
-    // Seed the seen set so we don't re-explore the initial corpus signatures.
+    
     let mut budget = max_iters;
     for c in &corpus {
         let _ = exercise(c);
@@ -203,7 +177,7 @@ pub fn run(
     let deadline = Duration::from_secs(seconds);
 
     while budget > 0 && start.elapsed() < deadline {
-        // Cycle through the corpus; evolve it as new signatures appear.
+        
         if corpus.is_empty() {
             corpus = base_seeds.clone();
         }
@@ -217,7 +191,7 @@ pub fn run(
             }
             match mutate_and_run(&input, &mut seen, &mut event_budget) {
                 Ok(kept) if !kept.is_empty() => {
-                    // New coverage: add to corpus, dump to disk as a seed.
+                    
                     corpus.push(kept.clone());
                     if corpus.len() > 8192 {
                         corpus.drain(..512);
@@ -229,7 +203,7 @@ pub fn run(
                 }
                 Ok(_) => {}
                 Err(msg) => {
-                    // A crash: dump the input and bail with an error.
+                    
                     let name = format!("crash-run-{:016x}.bin", iters);
                     let _ = fs::write(crash_dir.join(name), &input);
                     return Err(msg);

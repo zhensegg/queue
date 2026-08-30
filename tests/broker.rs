@@ -11,8 +11,6 @@ use zhensegg::security::AccessControl;
 use zhensegg::store::{MemRing, Store};
 use zhensegg::subscription::{SubMap, SubscriberMap};
 
-// ---- client-side helpers ----
-
 struct OwnedFrame {
     op: Op,
     topic: Vec<u8>,
@@ -21,7 +19,6 @@ struct OwnedFrame {
     len: Option<u32>,
 }
 
-/// Reads wire frames off the read half of a connection.
 struct FrameReader {
     read: OwnedReadHalf,
     parser: Parser,
@@ -61,18 +58,15 @@ impl FrameReader {
 
 fn encode_ping(buf: &mut Vec<u8>) {
     buf.extend_from_slice(&9u32.to_be_bytes());
-    buf.push(0x04); // Op::Ping
+    buf.push(0x04); 
     buf.extend_from_slice(&0u32.to_be_bytes());
     buf.extend_from_slice(&0u32.to_be_bytes());
 }
 
-/// Split one connected stream into a write half and a read-side reader.
 fn client(stream: TcpStream) -> (OwnedWriteHalf, FrameReader) {
     let (read, write) = stream.into_split();
     (write, FrameReader::new(read))
 }
-
-// ---- server harness ----
 
 struct Harness {
     store: Arc<dyn Store>,
@@ -99,8 +93,6 @@ impl Harness {
         TcpStream::connect(self.listener.local_addr().unwrap()).await.unwrap()
     }
 
-    /// Spawn a background task that accepts `n` connections and drives each
-    /// through `handle_tokio_conn`.
     fn spawn_servers(&self, n: usize) -> tokio::task::JoinHandle<()> {
         let connector = self.listener.clone();
         let store = self.store.clone();
@@ -115,7 +107,7 @@ impl Harness {
                 let metrics = metrics.clone();
                 let auth = auth.clone();
                 tokio::spawn(async move {
-                    let _ = handle_tokio_conn(stream, i as u64 + 1, store, subs, metrics, auth, None).await;
+                    let _ = handle_tokio_conn(stream, i as u64 + 1, store, subs, metrics, auth, None, false, std::time::Duration::from_secs(10)).await;
                 });
             }
         })
@@ -130,12 +122,9 @@ fn decode_record(raw: &[u8]) -> (Vec<u8>, Vec<u8>) {
     (topic, payload)
 }
 
-// ---- security / auth tests ----
-
 #[tokio::test]
 async fn broker_rejects_publish_before_auth() {
-    // Token-protected server. A client that publishes without authenticating
-    // must be rejected (connection closed) and the failure counted.
+    
     let h = Harness::with_auth(AccessControl::token("s3cret")).await;
     let _server = h.spawn_servers(1);
     let (mut w, mut r) = client(h.connect().await);
@@ -144,7 +133,6 @@ async fn broker_rejects_publish_before_auth() {
     encode_publish(&mut frame, b"orders", b"hack");
     w.write_all(&frame).await.unwrap();
 
-    // No ack -> connection should be closed by the auth gate.
     let next = r.next().await;
     assert!(next.is_none(), "unauthorized publish must close the connection");
     assert_eq!(h.metrics.auth_failures_total.get(), 1.0);
@@ -178,7 +166,6 @@ async fn broker_valid_token_then_publish_works() {
     assert_eq!(ack.op, Op::Ack);
     assert_eq!(ack.topic.as_slice(), b"auth");
 
-    // Now the connection is authenticated: publish is honoured.
     let mut p = Vec::new();
     encode_publish(&mut p, b"orders", b"allowed");
     w.write_all(&p).await.unwrap();
@@ -186,7 +173,6 @@ async fn broker_valid_token_then_publish_works() {
     assert_eq!(p_ack.op, Op::Ack);
     assert_eq!(h.metrics.auth_successes_total.get(), 1.0);
 }
-
 
 #[tokio::test]
 async fn broker_publish_acks_and_stores_record() {
@@ -204,7 +190,6 @@ async fn broker_publish_acks_and_stores_record() {
     let len = ack.len.expect("len");
     assert!(len > 0);
 
-    // the record is readable from the shared store
     let mut raw = Vec::new();
     h.store.read(off, len, &mut raw).unwrap();
     let (topic, payload) = decode_record(&raw);
@@ -218,14 +203,12 @@ async fn broker_subscribe_then_fetch_data() {
     let _server = h.spawn_servers(1);
     let (mut w, mut r) = client(h.connect().await);
 
-    // subscribe
     let mut f = Vec::new();
     encode_subscribe(&mut f, b"news");
     w.write_all(&f).await.unwrap();
     let ack = r.next().await.expect("subscribe ack");
     assert_eq!(ack.op, Op::Ack);
 
-    // publish on the same connection
     let mut p = Vec::new();
     encode_publish(&mut p, b"news", b"breaking");
     w.write_all(&p).await.unwrap();
@@ -234,7 +217,6 @@ async fn broker_subscribe_then_fetch_data() {
     let off = p_ack.offset.unwrap();
     let len = p_ack.len.unwrap();
 
-    // fetch the published record back by offset
     let mut q = Vec::new();
     encode_fetch(&mut q, b"news", off, len);
     w.write_all(&q).await.unwrap();
@@ -251,19 +233,16 @@ async fn broker_fanout_delivers_to_subscriber() {
     let (mut sub_w, mut sub_r) = client(h.connect().await);
     let (mut pub_w, _pub_r) = client(h.connect().await);
 
-    // subscriber subscribes to "news"; ack confirms registration completed
     let mut f = Vec::new();
     encode_subscribe(&mut f, b"news");
     sub_w.write_all(&f).await.unwrap();
     let ack = sub_r.next().await.expect("subscribe ack");
     assert_eq!(ack.op, Op::Ack);
 
-    // publisher publishes to the same topic
     let mut p = Vec::new();
     encode_publish(&mut p, b"news", b"broadcast");
     pub_w.write_all(&p).await.unwrap();
 
-    // subscriber receives the Data frame (after its ack)
     let data = sub_r.next().await.expect("data frame");
     assert_eq!(data.op, Op::Data);
     assert_eq!(data.topic.as_slice(), b"news");
@@ -297,17 +276,14 @@ async fn broker_cleans_up_subscription_on_disconnect() {
     let ack = r.next().await.expect("subscribe ack");
     assert_eq!(ack.op, Op::Ack);
 
-    // subscription is now registered
     {
         let g = h.subs.read(b"topic-x");
         assert!(g.contains_key(b"topic-x".as_slice()));
     }
 
-    // closing the connection should trigger cleanup
     drop(w);
     while r.next().await.is_some() {}
 
-    // give the broker a moment to finalize cleanup
     tokio::time::sleep(std::time::Duration::from_millis(50)).await;
     let g = h.subs.read(b"topic-x");
     assert!(!g.contains_key(b"topic-x".as_slice()), "subscriber removed after disconnect");

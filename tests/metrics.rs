@@ -53,7 +53,7 @@ fn metrics_render_reflects_counter_values() {
 #[test]
 fn metrics_ready_and_up() {
     let m = Metrics::new();
-    // uptime immediately after construction should be a small positive number
+    
     assert!(m.uptime_seconds() >= 0.0);
 }
 

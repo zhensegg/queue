@@ -1,8 +1,5 @@
-//! Socket setup: SO_REUSEPORT listener, per-connection tuning, core affinity.
-
 use std::net::TcpListener;
 
-/// Bind a TCP listener with SO_REUSEPORT + Linux socket tuning.
 #[cfg(target_os = "linux")]
 pub fn bind_reuse_port(addr: &str) -> std::io::Result<TcpListener> {
     use std::os::unix::io::AsRawFd;
@@ -12,7 +9,7 @@ pub fn bind_reuse_port(addr: &str) -> std::io::Result<TcpListener> {
     let domain = Domain::for_address(std_addr);
     let socket = Socket::new(domain, Type::STREAM, None)?;
     socket.set_reuse_address(true)?;
-    // SO_REUSEPORT via libc (socket2 0.5 set_reuse_port may not be available)
+    
     let optval: libc::c_int = 1;
     let ret = unsafe {
         libc::setsockopt(
@@ -26,7 +23,7 @@ pub fn bind_reuse_port(addr: &str) -> std::io::Result<TcpListener> {
     if ret != 0 {
         return Err(std::io::Error::last_os_error());
     }
-    // buffers on listener (accepted sockets inherit) + busy poll best-effort
+    
     let bufsz: libc::c_int = 1 << 20;
     unsafe {
         let _ = libc::setsockopt(socket.as_raw_fd(), libc::SOL_SOCKET, libc::SO_RCVBUF, &bufsz as *const _ as *const libc::c_void, std::mem::size_of_val(&bufsz) as libc::socklen_t);
@@ -49,7 +46,6 @@ pub fn bind_reuse_port(addr: &str) -> std::io::Result<TcpListener> {
     Ok(std_listener)
 }
 
-/// Per-connection socket tuning (NODELAY, QUICKACK, buffers, busy poll).
 #[cfg(target_os = "linux")]
 #[allow(dead_code)]
 pub fn tune_socket(fd: std::os::unix::io::RawFd) {
@@ -65,7 +61,6 @@ pub fn tune_socket(fd: std::os::unix::io::RawFd) {
     }
 }
 
-/// Pin the current thread to a CPU core.
 #[cfg(target_os = "linux")]
 pub fn core_affinity_attempt(core_id: usize) -> std::io::Result<()> {
     use std::mem;
@@ -85,8 +80,6 @@ pub fn core_affinity_attempt(_core_id: usize) -> std::io::Result<()> {
     Ok(())
 }
 
-
-/// Bind a tokio TCP listener, preferring SO_REUSEPORT on Linux.
 pub async fn bind_listener(addr: &str) -> std::io::Result<tokio::net::TcpListener> {
     use tokio::net::TcpListener;
     #[cfg(target_os = "linux")]

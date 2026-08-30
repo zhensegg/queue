@@ -1,17 +1,3 @@
-//! Accept loop: spawn one connection task per inbound connection.
-//!
-//! Transport security is snapshot once per accepted connection from the shared
-//! [`SharedSecurity`] holder, so a `SIGHUP` rotation only affects new
-//! connections. When a TLS acceptor is present, each accepted socket is first
-//! driven through the TLS handshake, then handed to the TLS connection driver.
-//! The handshake is the only TLS cost and happens once per connection, off the
-//! hot path.
-//!
-//! Resilience: `--max-connections` bounds the number of concurrently handled
-//! connections with a semaphore, and `--auth-timeout-secs` bounds both the TLS
-//! handshake and how long a connection may sit unauthenticated before it is
-//! dropped.
-
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
@@ -25,7 +11,6 @@ use crate::security::SharedSecurity;
 use crate::store::Store;
 use crate::subscription::SubscriberMap;
 
-/// Accept connections until the shutdown flag is set.
 pub async fn accept_loop(
     listener: tokio::net::TcpListener,
     store: Arc<dyn Store>,
@@ -38,6 +23,8 @@ pub async fn accept_loop(
     let max_conns = cfg.max_connections;
     let sem = max_conns.map(|n| Arc::new(tokio::sync::Semaphore::new(n)));
     let auth_timeout = Duration::from_secs(cfg.auth_timeout_secs);
+    let durable_acks = cfg.durable_acks;
+    let durable_ack_timeout = Duration::from_secs(cfg.durable_ack_timeout_secs);
 
     let mut next_id: u64 = 0;
     loop {
@@ -47,8 +34,7 @@ pub async fn accept_loop(
         }
         match tokio::time::timeout(Duration::from_millis(200), listener.accept()).await {
             Ok(Ok((socket, peer))) => {
-                // Respect the connection cap: if a cap is configured and its
-                // semaphore is exhausted, drop the accepted socket immediately.
+                
                 let permit = match &sem {
                     None => None,
                     Some(s) => match s.clone().try_acquire_owned() {
@@ -74,7 +60,7 @@ pub async fn accept_loop(
                                 let hs_timeout = tokio::time::timeout(auth_timeout_c, acceptor.accept(socket));
                                 match hs_timeout.await {
                                     Ok(Ok(tls_stream)) => {
-                                        let _ = connection::handle_tls_conn(tls_stream, id, store_c, subs_c, metrics_c, auth_c, Some(auth_timeout_c)).await;
+                                        let _ = connection::handle_tls_conn(tls_stream, id, store_c, subs_c, metrics_c, auth_c, Some(auth_timeout_c), durable_acks, durable_ack_timeout).await;
                                     }
                                     Ok(Err(e)) => {
                                         warn!(connection_id = id, error = %e, "tls handshake failed");
@@ -85,7 +71,7 @@ pub async fn accept_loop(
                                 }
                             }
                             None => {
-                                let _ = connection::handle_tokio_conn(socket, id, store_c, subs_c, metrics_c, auth_c, Some(auth_timeout_c)).await;
+                                let _ = connection::handle_tokio_conn(socket, id, store_c, subs_c, metrics_c, auth_c, Some(auth_timeout_c), durable_acks, durable_ack_timeout).await;
                             }
                         }
                     }
@@ -96,7 +82,7 @@ pub async fn accept_loop(
                 warn!(error = %e, "accept error");
             }
             Err(_) => {
-                // poll timeout: re-check shutdown flag
+                
             }
         }
     }

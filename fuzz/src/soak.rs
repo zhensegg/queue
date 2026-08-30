@@ -1,18 +1,3 @@
-//! Soak harness: hammer a *running* broker binary over real TCP.
-//!
-//! This is the "fuzz the binary over the wire" layer. It opens many parallel
-//! connections that interleave malformed byte garbage and well-formed frames
-//! (publish/subscribe/fetch/auth), so the length-prefix parser is forced to
-//! resync and handle hostile framing against a live process. Each flooder then
-//! closes cleanly.
-//!
-//! A soak run is green only if, after the whole flood, a *fresh* connection can
-//! still authenticate (when a token is configured) and complete a Ping/ack
-//! round-trip. Truncated mid-stream frames legitimately desync a single
-//! length-prefix stream (the broker faithfully waits for the declared body), so
-//! liveness is asserted on a brand-new connection rather than on stream
-//! alignment.
-
 use std::io::{Read, Write};
 use std::net::TcpStream;
 use std::time::{Duration, Instant};
@@ -21,9 +6,6 @@ use rand::Rng;
 
 use zhensegg::protocol::{Op, encode_auth, encode_fetch, encode_frame, encode_publish, encode_subscribe};
 
-/// Flood one connection with mixed good/bad frames, then close it. Returns the
-/// number of response bytes drained (best-effort) and whether the broker
-/// accepted the connection at all.
 fn flood_connection(addr: &str, auth: Option<&[u8]>, bytes: usize) -> anyhow::Result<u64> {
     let mut stream = TcpStream::connect(addr).map_err(|e| anyhow::anyhow!("connect: {e}"))?;
     stream.set_nodelay(true)?;
@@ -56,21 +38,18 @@ fn flood_connection(addr: &str, auth: Option<&[u8]>, bytes: usize) -> anyhow::Re
                 encode_fetch(&mut frame, b"topic0", rng.gen_range(0..1_000_000), rng.gen_range(0..256));
             }
             62..=74 => {
-                // Pure garbage bytes the parser must reject gracefully.
+                
                 let g = vec![rng.gen(); rng.gen_range(1..64)];
                 frame.extend_from_slice(&g);
             }
             75..=89 => {
-                // A length prefix claiming far more than we actually send
-                // (forces the broker to desync and buffer a phantom body).
+                
                 let big = rng.gen_range(2u32..1_000_000);
                 frame.extend_from_slice(&big.to_be_bytes());
                 frame.extend_from_slice(&[rng.gen(); 4]);
             }
             _ => {
-                // A sub-MINIMAL total_len (0..8) is already enough to have
-                // reached into the header; make sure hostile tiny lengths flow
-                // too. This exercises the parser's length-validation guard.
+                
                 let tiny = rng.gen_range(0u32..9);
                 frame.extend_from_slice(&tiny.to_be_bytes());
                 frame.extend_from_slice(&[rng.gen(); 2]);
@@ -80,11 +59,11 @@ fn flood_connection(addr: &str, auth: Option<&[u8]>, bytes: usize) -> anyhow::Re
         if stream.write_all(&frame).is_err() {
             break;
         }
-        // Best-effort drain so the socket never fills.
+        
         let started = Instant::now();
         while started.elapsed() < Duration::from_millis(1) {
             match stream.set_nonblocking(true).and_then(|_| stream.read(&mut readbuf)) {
-                Ok(0) => return Ok(drained), // broker closed us: still handled
+                Ok(0) => return Ok(drained), 
                 Ok(n) => drained += n as u64,
                 Err(_) => break,
             }
@@ -94,8 +73,6 @@ fn flood_connection(addr: &str, auth: Option<&[u8]>, bytes: usize) -> anyhow::Re
     Ok(drained)
 }
 
-/// Open a fresh connection and complete a Ping/ack round-trip (after optional
-/// auth). Returns Ok(()) only if the server answered.
 fn probe_liveness(addr: &str, auth: Option<&[u8]>) -> anyhow::Result<()> {
     let mut stream = TcpStream::connect(addr).map_err(|e| anyhow::anyhow!("probe connect: {e}"))?;
     stream.set_nodelay(true)?;
@@ -111,9 +88,7 @@ fn probe_liveness(addr: &str, auth: Option<&[u8]>) -> anyhow::Result<()> {
     stream.write_all(&ping)?;
     stream.flush()?;
     let mut readbuf = [0u8; 4096];
-    // The socket has a 2s read timeout, so a single blocking read is enough to
-    // bound the wait: any bytes from the server mean it parsed our Ping and
-    // answered; a timeout or close means it did not.
+    
     match stream.read(&mut readbuf) {
         Ok(n) if n > 0 => return Ok(()),
         _ => {}
@@ -121,9 +96,6 @@ fn probe_liveness(addr: &str, auth: Option<&[u8]>) -> anyhow::Result<()> {
     anyhow::bail!("broker did not answer Ping probe on fresh connection to {addr}")
 }
 
-/// Run the soak: `conns` parallel flooders, each sending `seconds` of traffic,
-/// then a fresh liveness probe. Green iff the fresh probe succeeds for every
-/// connection's worth of abuse (we probe once more at the end).
 pub fn run(
     addr: &str,
     auth: Option<&[u8]>,
@@ -147,8 +119,6 @@ pub fn run(
             .map_err(|_| anyhow::anyhow!("soak thread panicked"))??;
     }
 
-    // The real assertion: after all that abuse the broker still accepts a fresh
-    // connection and answers a Ping.
     probe_liveness(addr, auth)?;
 
     eprintln!(

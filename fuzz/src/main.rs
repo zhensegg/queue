@@ -1,14 +1,3 @@
-//! Zhensegg protocol fuzzer + soak harness (CLI wrapper around the library).
-//!
-//! * `zhensegg-fuzz fuzz|check [--seconds N] [--iters N] [--corpus DIR] [--crash DIR]`
-//!   — in-process, coverage-guided mutation fuzzing of the real wire parser.
-//! * `zhensegg-fuzz soak --addr HOST:PORT [--auth-token FILE] [--conns N] [--seconds N]`
-//!   — flood a *running* broker binary over TCP with mixed good/bad frames and
-//!     verify it keeps answering a fresh-connection Ping probe.
-//!
-//! `check` runs a bounded fuzz pass and returns non-zero if any input crashed
-//! the parser — that is what CI and the container entrypoint use.
-
 use std::path::PathBuf;
 use std::process::ExitCode;
 

@@ -1,5 +1,3 @@
-//! In-memory ring store with lock-free append.
-
 use std::sync::atomic::{AtomicU64, Ordering};
 
 #[derive(Debug)]
@@ -17,13 +15,16 @@ impl From<std::io::Error> for StoreError {
 }
 
 pub trait Store: Send + Sync {
-    /// Append payload for topic, returns global byte offset and len.
     fn append(&self, topic: &[u8], payload: &[u8]) -> Result<(u64, u32), StoreError>;
-    /// Read payload by offset. Copies into out buffer.
     fn read(&self, offset: u64, len: u32, out: &mut Vec<u8>) -> Result<(), StoreError>;
     fn write_pos(&self) -> u64;
-    /// Position durable for THIS store's semantics (mem: written to RAM; file: fdatasync'd to disk).
     fn durable_pos(&self) -> u64 {
+        self.write_pos()
+    }
+    fn durable_gate(&self) -> Option<std::sync::Arc<super::durable::DurableGate>> {
+        None
+    }
+    fn sync_pending(&self, _timeout: std::time::Duration) -> u64 {
         self.write_pos()
     }
 }
@@ -52,24 +53,24 @@ pub fn try_register_file(file: &std::fs::File) {
     });
 }
 
-/// In-memory circular buffer. Fast path for >11M in-memory benchmark.
-/// No disk, no fsync, pure memory sequential access.
-/// Layout for each record: [4 topic_len][4 payload_len][topic][payload]
-/// Lock-free append via UnsafeCell + atomic reservation for linear scalability.
-/// Concurrent appends to disjoint offsets do NOT contend on lock.
 pub struct MemRing {
     buf: std::cell::UnsafeCell<Vec<u8>>,
     capacity: usize,
-    write_pos: AtomicU64, // monotonic byte offset (not circular index)
-    committed: AtomicU64, // fully copied records only (torn-read guard for flusher)
+    write_pos: AtomicU64,
+    committed: AtomicU64,
     records: AtomicU64,
 }
 
-// SAFETY: buf is accessed via raw pointers to disjoint regions.
-// Each append reserves unique [offset, offset+len) via atomic fetch_add, so no aliasing.
-// Reads race with writes only when ring wraps; caller checks for overwrite.
 unsafe impl Sync for MemRing {}
 unsafe impl Send for MemRing {}
+
+#[cfg(target_os = "linux")]
+fn harden(v: &mut [u8]) {
+    unsafe {
+        let _ = libc::madvise(v.as_mut_ptr() as *mut libc::c_void, v.len(), libc::MADV_HUGEPAGE);
+        let _ = libc::mlock(v.as_ptr() as *const libc::c_void, v.len());
+    }
+}
 
 impl MemRing {
     pub fn new(capacity: usize) -> Self {
@@ -83,7 +84,6 @@ impl MemRing {
         };
         #[cfg(target_os = "linux")]
         {
-            // best-effort register fixed buffer for io_uring to avoid per-op mmap
             let buf_ref: &[u8] = unsafe { &*ring.buf.get() };
             try_register_buffers(buf_ref);
         }
@@ -93,12 +93,7 @@ impl MemRing {
     #[cfg(target_os = "linux")]
     fn alloc(cap: usize) -> Vec<u8> {
         let mut v = vec![0u8; cap];
-        unsafe {
-            // THP: 2MB transparent huge pages (glibc mmap's large allocs -> page aligned)
-            let _ = libc::madvise(v.as_mut_ptr() as *mut libc::c_void, cap, libc::MADV_HUGEPAGE);
-            // prefault all pages + pin in RAM: no page faults on hot path
-            let _ = libc::mlock(v.as_ptr() as *const libc::c_void, cap);
-        }
+        harden(&mut v);
         v
     }
 
@@ -107,8 +102,30 @@ impl MemRing {
         vec![0u8; cap]
     }
 
+    pub fn from_buffer(data: Vec<u8>, capacity: usize, write_pos: u64, committed: u64) -> Self {
+        assert_eq!(data.len(), capacity, "recovered ring bytes must match capacity");
+        debug_assert!(committed <= write_pos);
+        #[allow(unused_mut)]
+        let mut buf = data;
+        #[cfg(target_os = "linux")]
+        harden(&mut buf);
+        let ring = Self {
+            buf: std::cell::UnsafeCell::new(buf),
+            capacity,
+            write_pos: AtomicU64::new(write_pos),
+            committed: AtomicU64::new(committed),
+            records: AtomicU64::new(0),
+        };
+        #[cfg(target_os = "linux")]
+        {
+            let buf_ref: &[u8] = unsafe { &*ring.buf.get() };
+            try_register_buffers(buf_ref);
+        }
+        ring
+    }
+
     pub fn with_default() -> Self {
-        Self::new(256 * 1024 * 1024) // 256 MB ring
+        Self::new(256 * 1024 * 1024)
     }
 
     #[inline]
@@ -136,7 +153,6 @@ impl Store for MemRing {
                 std::ptr::copy_nonoverlapping(topic.as_ptr(), dst.add(8), topic.len());
                 std::ptr::copy_nonoverlapping(payload.as_ptr(), dst.add(8 + topic.len()), payload.len());
             } else {
-                // wrap: need to handle split - copy via intermediate tmp to preserve atomicity
                 let mut tmp = Vec::with_capacity(rec_len);
                 tmp.extend_from_slice(&(topic.len() as u32).to_be_bytes());
                 tmp.extend_from_slice(&(payload.len() as u32).to_be_bytes());
@@ -148,7 +164,6 @@ impl Store for MemRing {
             }
         }
         self.records.fetch_add(1, Ordering::Relaxed);
-        // mark record fully copied (monotonic max; torn-read guard for flusher)
         self.committed.fetch_max(offset + rec_len as u64, Ordering::Release);
         Ok((offset, rec_len as u32))
     }
@@ -184,7 +199,6 @@ impl Store for MemRing {
 }
 
 impl MemRing {
-    /// Fully-copied records (no torn reads past this point)
     pub fn committed_pos(&self) -> u64 {
         self.committed.load(Ordering::Acquire)
     }

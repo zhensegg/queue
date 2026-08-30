@@ -1,21 +1,3 @@
-//! Honest production benchmark for the Zhensegg broker.
-//!
-//! Design goals:
-//!   * CLOSED LOOP — a producer waits for the broker's ACK of every message it
-//!     sent before sending the next batch. Throughput is counted on ACKs only,
-//!     never on "bytes written to the socket", so it reflects real sustained RPS.
-//!   * PRODUCER / CONSUMER ON SEPARATE THREADS — every producer and every
-//!     consumer runs on its own OS thread with its own tokio runtime and its own
-//!     TCP connection. This is the honest production topology, not a shared
-//!     connection with multiplexed tasks.
-//!   * E2E DELIVERY LATENCY — the first 8 bytes of each payload carry a
-//!     nanosecond timestamp written by the producer; the consumer measures the
-//!     round trip from publish to delivery.
-//!   * DURABILITY VERIFICATION (file mode) — sampled ACKed records are re-read
-//!     straight off media with O_DIRECT (bypassing the page cache) and their
-//!     content is compared to what the producer sent. Any mismatch on a
-//!     not-yet-overwritten ring means a durability violation.
-
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -25,10 +7,6 @@ use tokio::io::{AsyncRead, AsyncWrite, AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use zhensegg::protocol::{Op, Parser as RingParser, encode_auth, encode_publish, encode_subscribe};
 
-// ---------------------------------------------------------------------------
-// Transport wrapper: either a plain TCP stream or a rustls client stream, so
-// the benchmark can run the identical closed-loop workload over TLS.
-// ---------------------------------------------------------------------------
 enum Conn {
     Plain(TcpStream),
     Tls(tokio_rustls::client::TlsStream<TcpStream>),
@@ -104,7 +82,6 @@ async fn tune(stream: &TcpStream) {
     let _ = stream;
 }
 
-/// Build a TLS client connector trusting the given CA/self-signed PEM file.
 fn build_connector(cafile: &str) -> std::io::Result<Arc<tokio_rustls::TlsConnector>> {
     use rustls::RootCertStore;
     rustls::crypto::ring::default_provider().install_default().ok();
@@ -121,7 +98,6 @@ fn build_connector(cafile: &str) -> std::io::Result<Arc<tokio_rustls::TlsConnect
     Ok(Arc::new(tokio_rustls::TlsConnector::from(Arc::new(config))))
 }
 
-/// Establish a transport connection and, if a token is given, authenticate.
 async fn connect_conn(
     addr: &str,
     tls: bool,
@@ -149,7 +125,7 @@ async fn connect_conn(
         let mut auth = Vec::new();
         encode_auth(&mut auth, tok);
         conn.write_all(&auth).await?;
-        // read the auth ack before proceeding
+        
         let mut parser = RingParser::new(64 * 1024);
         let mut buf = vec![0u8; 64 * 1024];
         loop {
@@ -178,53 +154,40 @@ struct Args {
     #[arg(long, default_value = "bench")]
     topic: String,
 
-    /// Total messages to publish across all producers.
     #[arg(long, default_value = "4000000")]
     msgs: usize,
 
     #[arg(long, default_value = "32")]
     payload_size: usize,
 
-    /// Number of producer OS threads (one TCP connection each).
     #[arg(long, default_value = "8")]
     producers: usize,
 
-    /// Number of consumer OS threads (one TCP connection each).
     #[arg(long, default_value = "0")]
     consumers: usize,
 
-    /// Batch (in-flight messages per producer round trip).
     #[arg(long, default_value = "256")]
     batch: usize,
 
-    /// Run for N seconds instead of a fixed message count.
     #[arg(long, default_value = "0")]
     secs: u64,
 
-    /// Ring file path; when set, sampled ACKed records are verified on media (O_DIRECT).
     #[arg(long)]
     verify_file: Option<String>,
 
-    /// Max e2e latency samples collected per consumer.
     #[arg(long, default_value = "100000")]
     samples: usize,
 
-    /// Connect over TLS. Requires --cafile to verify the broker cert.
     #[arg(long)]
     tls: bool,
 
-    /// PEM file of the CA/self-signed cert used by the broker's TLS endpoint.
     #[arg(long)]
     cafile: Option<String>,
 
-    /// Shared auth token sent as the first Auth frame (works with or without --tls).
     #[arg(long)]
     auth_token: Option<String>,
 }
 
-// ---------------------------------------------------------------------------
-// O_DIRECT durability verification of the persistent ring file (Linux only).
-// ---------------------------------------------------------------------------
 #[cfg(target_os = "linux")]
 fn verify_on_disk(path: &str, samples: &[(u64, u64, u64)], payload_size: usize, topic_len: usize) -> (usize, usize, usize) {
     use std::os::unix::fs::OpenOptionsExt;
@@ -244,7 +207,7 @@ fn verify_on_disk(path: &str, samples: &[(u64, u64, u64)], payload_size: usize, 
     let mut mismatch = 0usize;
     for &(off, len, ts_sent) in samples {
         let file_off = (off as usize) % fsize;
-        if file_off + len as usize > fsize { continue; } // straddles ring boundary
+        if file_off + len as usize > fsize { continue; } 
         let start = file_off & !(align - 1);
         let end = (file_off + len as usize + align - 1) & !(align - 1);
         let sz = end - start;
@@ -264,10 +227,10 @@ fn verify_on_disk(path: &str, samples: &[(u64, u64, u64)], payload_size: usize, 
                     if ts_disk == ts_sent && p[8..].iter().all(|&b| b == b'x') {
                         ok += 1;
                     } else {
-                        mismatch += 1; // region overwritten by a newer record (ring wrap) or corrupted
+                        mismatch += 1; 
                     }
                 } else {
-                    mismatch += 1; // header of a different record => overwritten (ring wrap)
+                    mismatch += 1; 
                 }
             } else {
                 mismatch += 1;
@@ -326,7 +289,6 @@ fn main() {
         println!("[bench] transport=secure (tls={} auth={})", args.tls, args.auth_token.is_some());
     }
 
-    // ---- start consumers FIRST so they can subscribe before loads begin ----
     let mut consumer_handles = Vec::new();
     for cid in 0..args.consumers {
         let (addr, topic) = (args.addr.clone(), args.topic.clone());
@@ -351,7 +313,6 @@ fn main() {
     let target_per = if args.secs > 0 { usize::MAX } else { args.msgs / args.producers.max(1) };
     let deadline = if args.secs > 0 { Some(Instant::now() + Duration::from_secs(args.secs)) } else { None };
 
-    // ---- start producers, each on its own OS thread with its own runtime ----
     let mut producer_handles = Vec::new();
     for pid in 0..args.producers {
         let (addr, topic) = (args.addr.clone(), args.topic.clone());
@@ -375,7 +336,6 @@ fn main() {
         producer_handles.push(handle);
     }
 
-    // ---- live progress ----
     let mut last_a = 0u64;
     let mut last_c = 0u64;
     let mut last_t = t_start;
@@ -395,17 +355,12 @@ fn main() {
     for h in producer_handles { let _ = h.join(); }
     let t_pub_end = t_start.elapsed().as_secs_f64();
 
-    // ---- drain window: measure backlog the consumer burns off ----
     let drain_until = Instant::now() + Duration::from_secs(5);
     while Instant::now() < drain_until {
         if args.consumers == 0 || consumed.load(Ordering::Relaxed) >= acked.load(Ordering::Relaxed) { break; }
         std::thread::sleep(Duration::from_millis(50));
     }
-    // NOTE: we intentionally do NOT join the consumer threads here. A consumer
-    // only ends when the broker closes its socket, which the broker does not do
-    // for idle connections; joining would hang forever. All e2e samples were
-    // already flushed into the shared vec during the drain window. Dropping the
-    // handles lets the process exit normally and the OS reclaim the threads.
+    
     drop(consumer_handles);
 
     let t_total = t_start.elapsed().as_secs_f64();
@@ -426,7 +381,6 @@ fn main() {
         println!("e2e delivery latency ({} samples): {}", e.len(), fmt_pcts(&mut e, 1000.0));
     }
 
-    // ---- MEGA-HONEST: verify sampled ACKed records are actually on media ----
     if let Some(path) = &args.verify_file {
         let s = disk_samples.lock().unwrap().clone();
         if s.is_empty() {
@@ -449,9 +403,6 @@ fn main() {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Producer: one OS thread, one TCP connection, closed-loop batched publishing.
-// ---------------------------------------------------------------------------
 async fn producer_task(
     pid: usize,
     addr: String,
@@ -493,7 +444,7 @@ async fn producer_task(
         }
         let t_send = Instant::now();
         stream.write_all(&batch_buf).await?;
-        // closed loop: wait for ALL b ACKs before sending the next batch
+        
         let mut got = 0usize;
         let mut ack_index = 0usize;
         while got < b {
@@ -528,9 +479,6 @@ async fn producer_task(
     Ok(())
 }
 
-// ---------------------------------------------------------------------------
-// Consumer: one OS thread, one TCP connection, subscribes and measures e2e.
-// ---------------------------------------------------------------------------
 async fn consumer_task(
     cid: usize,
     addr: String,
@@ -560,7 +508,7 @@ async fn consumer_task(
                 if local.len() < max_samples {
                     let ts = u64::from_be_bytes(f.payload[0..8].try_into().unwrap());
                     let d = now_ns().saturating_sub(ts);
-                    if d < 60_000_000_000 { local.push(d); } // drop >60s outliers
+                    if d < 60_000_000_000 { local.push(d); } 
                 }
             }
             parser.consume();

@@ -38,7 +38,7 @@ ExecStart=/usr/local/bin/zhensegg-broker \
     --auth-timeout-secs 10
 ExecStartPre=/usr/bin/mkdir -p /var/lib/zhensegg /run/zhensegg
 ExecStartPre=/usr/bin/chown -R zhensegg:zhensegg /var/lib/zhensegg /run/zhensegg
-Restart=on-failure
+Restart=always
 RestartSec=2
 LimitNOFILE=1048576
 StateDirectory=zhensegg

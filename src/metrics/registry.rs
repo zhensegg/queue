@@ -1,5 +1,3 @@
-//! Prometheus metrics registry.
-
 use std::time::Instant;
 
 use prometheus::{

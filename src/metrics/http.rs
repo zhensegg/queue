@@ -1,5 +1,3 @@
-//! HTTP handlers for /metrics and /ready.
-
 use std::sync::Arc;
 
 use axum::extract::State;
@@ -13,7 +11,7 @@ pub async fn metrics_handler(State(metrics): State<Arc<Metrics>>) -> impl IntoRe
 }
 
 pub async fn ready_handler(State(metrics): State<Arc<Metrics>>) -> impl IntoResponse {
-    // Ready if initialized (uptime > 0) and no extreme backlog
+    
     let status = if metrics.uptime_seconds() > 0.0 && metrics.backlog_size.get() < 10_000_000.0 {
         StatusCode::OK
     } else {

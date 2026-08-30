@@ -1,5 +1,3 @@
-//! Prometheus metrics integration.
-
 pub mod registry;
 pub mod http;
 

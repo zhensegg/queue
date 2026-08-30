@@ -1,5 +1,3 @@
-//! HTTP handler for /health.
-
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
@@ -11,7 +9,6 @@ use crate::metrics::Metrics;
 
 use super::{Checks, HealthStatus, StoreHealth};
 
-/// Shared health snapshot, updated by the broker loop.
 #[derive(Clone)]
 pub struct HealthState {
     pub metrics: Arc<Metrics>,
@@ -40,7 +37,6 @@ pub async fn health_handler(State(state): State<HealthState>) -> impl IntoRespon
     let write_pos = state.write_pos.load(Ordering::Relaxed);
     let durable = state.durable_pos.load(Ordering::Relaxed);
 
-    // Health evaluation
     let store_write_ok = state.store_type != "file" || durable >= write_pos.saturating_sub(1024 * 1024);
     let status = if store_write_ok {
         "healthy"

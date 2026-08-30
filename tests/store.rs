@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use zhensegg::store::{FileRing, MemRing, Store, StoreError};
+use zhensegg::store::{wait_durable, FileRing, MemRing, Store, StoreError};
 
 fn decode_record(raw: &[u8]) -> (Vec<u8>, Vec<u8>) {
     let tl = u32::from_be_bytes([raw[0], raw[1], raw[2], raw[3]]) as usize;
@@ -8,6 +8,12 @@ fn decode_record(raw: &[u8]) -> (Vec<u8>, Vec<u8>) {
     let topic = raw[8..8 + tl].to_vec();
     let payload = raw[8 + tl..8 + tl + pl].to_vec();
     (topic, payload)
+}
+
+fn scratch(name: &str) -> (std::path::PathBuf, String) {
+    let p = std::env::temp_dir().join(format!("zhensegg-{name}-{}.dat", std::process::id()));
+    let _ = std::fs::remove_file(&p);
+    (p.clone(), p.to_str().unwrap().to_string())
 }
 
 #[test]
@@ -54,8 +60,8 @@ fn test_memring_reads_back_all_messages() {
 
 #[test]
 fn test_memring_full_error_on_oversized_record() {
-    let ring = MemRing::new(64 * 1024); // min capacity
-    let big = vec![b'x'; 40 * 1024]; // rec > capacity/2
+    let ring = MemRing::new(64 * 1024);
+    let big = vec![b'x'; 40 * 1024];
     let err = ring.append(b"t", &big).unwrap_err();
     assert!(matches!(err, StoreError::Full));
 }
@@ -64,7 +70,6 @@ fn test_memring_full_error_on_oversized_record() {
 fn test_memring_invalid_offset_error() {
     let ring = MemRing::new(1024 * 1024);
     let (off, len) = ring.append(b"t", b"hello").unwrap();
-    // reading past write_pos is invalid
     let mut out = Vec::new();
     let err = ring.read(off + 10_000_000, len, &mut out).unwrap_err();
     assert!(matches!(err, StoreError::InvalidOffset));
@@ -72,21 +77,15 @@ fn test_memring_invalid_offset_error() {
 
 #[test]
 fn test_memring_wraps_around_and_reads() {
-    // minimum capacity is 64KB; write enough records to wrap the ring
     let ring = MemRing::new(64 * 1024);
-    let mut offsets_first = Vec::new();
     let mut offsets_last = Vec::new();
     for i in 0..2000 {
         let payload = format!("payload-{i}-with-some-length");
         let (off, len) = ring.append(b"topic", payload.as_bytes()).unwrap();
-        if i < 20 {
-            offsets_first.push((off, len));
-        }
         if i >= 1980 {
             offsets_last.push((off, len));
         }
     }
-    // old (overwritten) records may be NotFound; new ones must read back fine
     for (off, len) in offsets_last {
         let mut raw = Vec::new();
         if ring.read(off, len, &mut raw).is_ok() {
@@ -94,18 +93,13 @@ fn test_memring_wraps_around_and_reads() {
             assert_eq!(topic.as_slice(), b"topic");
         }
     }
-    let _ = offsets_first; // not verified: ring likely wrapped and overwrote them
     assert!(ring.write_pos() > 64 * 1024, "written enough to wrap");
 }
 
 #[test]
 fn test_file_ring_append_read_roundtrip() {
-    let path = std::env::temp_dir().join(format!(
-        "zhensegg-file-ring-test-{}.dat",
-        std::process::id()
-    ));
-    let _ = std::fs::remove_file(&path);
-    let ring = FileRing::new(path.to_str().unwrap(), 1024 * 1024).unwrap();
+    let (path, p) = scratch("ring-rt");
+    let ring = FileRing::new(&p, 1024 * 1024).unwrap();
     let (off, len) = ring.append(b"events", b"file-payload").unwrap();
     let mut raw = Vec::new();
     ring.read(off, len, &mut raw).unwrap();
@@ -119,12 +113,8 @@ fn test_file_ring_append_read_roundtrip() {
 
 #[test]
 fn test_file_ring_multiple_records() {
-    let path = std::env::temp_dir().join(format!(
-        "zhensegg-file-ring-multi-{}.dat",
-        std::process::id()
-    ));
-    let _ = std::fs::remove_file(&path);
-    let ring = FileRing::new(path.to_str().unwrap(), 1024 * 1024).unwrap();
+    let (path, p) = scratch("ring-multi");
+    let ring = FileRing::new(&p, 1024 * 1024).unwrap();
     let mut last = 0u64;
     for i in 0..100 {
         let payload = format!("m{i}");
@@ -132,29 +122,159 @@ fn test_file_ring_multiple_records() {
         assert!(off >= last);
         last = off;
     }
-    // On Linux the background flusher advances durable_pos to write_pos via
-    // group-commit; on Windows no flusher runs, so durable_pos stays at 0.
-    #[cfg(target_os = "linux")]
-    assert_eq!(ring.durable_pos(), ring.write_pos(), "all records readable");
-    #[cfg(not(target_os = "linux"))]
-    assert!(ring.write_pos() > 0);
+    let target = ring.write_pos();
+    let durable = ring.sync_pending(std::time::Duration::from_secs(5));
+    assert_eq!(durable, target, "all records flushted on demand");
     drop(ring);
     let _ = std::fs::remove_file(&path);
 }
 
 #[test]
 fn test_store_trait_object_dispatch() {
-    // both mem and file stores can be used behind the same trait object
     let mem: Arc<dyn Store> = Arc::new(MemRing::new(1024 * 1024));
     let (off, len) = mem.append(b"t", b"m1").unwrap();
     let mut raw = Vec::new();
     mem.read(off, len, &mut raw).unwrap();
 
-    let path = std::env::temp_dir().join(format!("zhensegg-trait-{}.dat", std::process::id()));
-    let _ = std::fs::remove_file(&path);
-    let file: Arc<dyn Store> = Arc::new(FileRing::new(path.to_str().unwrap(), 1024 * 1024).unwrap());
+    let (_path, p) = scratch("trait");
+    let file: Arc<dyn Store> = Arc::new(FileRing::new(&p, 1024 * 1024).unwrap());
     let (off2, len2) = file.append(b"t", b"f1").unwrap();
     let mut raw2 = Vec::new();
     file.read(off2, len2, &mut raw2).unwrap();
+    let _ = std::fs::remove_file(&_path);
+}
+
+#[test]
+fn test_file_ring_survives_kill9_and_reopens() {
+    let (path, p) = scratch("kill9");
+    {
+        let ring = FileRing::new(&p, 1024 * 1024).unwrap();
+        for i in 0..500 {
+            let payload = format!("m{i}");
+            let _ = ring.append(b"t", payload.as_bytes()).unwrap();
+        }
+        let _ = ring.sync_pending(std::time::Duration::from_secs(5));
+        let target = ring.durable_pos();
+        assert!(target > 0, "flusher must reach at least one group commit");
+        std::mem::forget(ring);
+        let _ = target;
+    }
+    let ring = FileRing::new(&p, 1024 * 1024).unwrap();
+    assert_eq!(ring.durable_pos(), ring.write_pos());
+    drop(ring);
     let _ = std::fs::remove_file(&path);
+}
+
+#[test]
+fn test_file_ring_corrupt_slot_falls_back_to_replica() {
+    let (path, p) = scratch("corrupt-slot");
+    {
+        let ring = FileRing::new(&p, 1024 * 1024).unwrap();
+        let _ = ring.append(b"t", b"x").unwrap();
+        let _ = ring.sync_pending(std::time::Duration::from_secs(5));
+        std::mem::forget(ring);
+    }
+    {
+        use std::io::{Seek, SeekFrom, Write};
+        let mut f = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
+        f.seek(SeekFrom::Start(0)).unwrap();
+        f.write_all(&[0xFF; 64]).unwrap();
+    }
+    let ring = FileRing::new(&p, 1024 * 1024).unwrap();
+    assert!(ring.durable_pos() >= 1, "replica slot must carry the committed position");
+    drop(ring);
+    let _ = std::fs::remove_file(&path);
+}
+
+#[test]
+fn test_file_ring_corrupt_header_refuses_startup() {
+    let (path, p) = scratch("corrupt-header");
+    {
+        let ring = FileRing::new(&p, 1024 * 1024).unwrap();
+        let _ = ring.append(b"t", b"x").unwrap();
+        let _ = ring.sync_pending(std::time::Duration::from_secs(5));
+        std::mem::forget(ring);
+    }
+    {
+        use std::io::{Seek, SeekFrom, Write};
+        let mut f = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
+        f.seek(SeekFrom::Start(0)).unwrap();
+        f.write_all(&[0xFF; 128]).unwrap();
+    }
+    let err = FileRing::new(&p, 1024 * 1024).err().expect("corrupt header must refuse startup");
+    assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+    let _ = std::fs::remove_file(&path);
+}
+
+#[test]
+fn test_file_ring_torn_tail_is_ignored() {
+    let (path, p) = scratch("torn");
+    let durable: u64;
+    {
+        let ring = FileRing::new(&p, 4 * 1024 * 1024).unwrap();
+for i in 0..1000 {
+            let payload = format!("torn-{i}");
+            let _ = ring.append(b"t", payload.as_bytes()).unwrap();
+        }
+        let _ = ring.sync_pending(std::time::Duration::from_secs(5));
+        durable = ring.durable_pos();
+        assert!(durable > 0);
+        std::mem::forget(ring);
+    }
+    {
+        use std::io::{Seek, SeekFrom, Write};
+        let mut f = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
+        f.seek(SeekFrom::Start(durable + 8192)).unwrap();
+        f.write_all(&[0xAA; 256]).unwrap();
+    }
+    let ring = FileRing::new(&p, 4 * 1024 * 1024).unwrap();
+    assert_eq!(ring.durable_pos(), durable, "torn tail beyond committed is ignored");
+    drop(ring);
+    let _ = std::fs::remove_file(&path);
+}
+
+#[test]
+fn test_file_ring_reopen_after_immediate_crash() {
+    let (_path, p) = scratch("immediate");
+    {
+        let ring = FileRing::new(&p, 1024 * 1024).unwrap();
+        let _ = ring.append(b"t", b"boom").unwrap();
+        std::mem::forget(ring);
+    }
+    let ring = FileRing::new(&p, 1024 * 1024).unwrap();
+    assert_eq!(ring.write_pos(), ring.durable_pos());
+    drop(ring);
+    let _ = std::fs::remove_file(&_path);
+}
+
+#[test]
+fn test_file_ring_durable_gate_waits_for_fsync() {
+    let (_path, p) = scratch("gate");
+    let ring = FileRing::new(&p, 1024 * 1024).unwrap();
+    let (off, len) = ring.append(b"t", b"durable").unwrap();
+    let need = off + len as u64;
+    let gate = ring.durable_gate().unwrap().clone();
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let result = rt.block_on(async {
+        let wait = wait_durable(gate, need);
+        tokio::time::timeout(std::time::Duration::from_secs(5), wait).await
+    });
+    assert!(result.is_ok(), "durable gate must reach the acked position");
+    assert!(ring.durable_pos() >= need);
+    drop(ring);
+    let _ = std::fs::remove_file(&_path);
+}
+
+#[cfg(unix)]
+#[test]
+fn test_file_ring_second_broker_rejected_by_flock() {
+    let (_path, p) = scratch("flock");
+    let ring = FileRing::new(&p, 1024 * 1024).unwrap();
+    let err = FileRing::new(&p, 1024 * 1024).err().expect("second broker must be rejected");
+    assert_eq!(err.kind(), std::io::ErrorKind::AlreadyExists);
+    drop(ring);
+    let _ = std::fs::remove_file(&_path);
 }

@@ -32,7 +32,7 @@ async fn health_mem_mode_is_healthy() {
 
 #[tokio::test]
 async fn health_file_mode_caught_up_is_healthy() {
-    // durable catches up to write within slack (1MB)
+    
     let s = state("file", 1024, 2048, 5000, 5000);
     let res = health_handler(State(s)).await.into_response();
     assert_eq!(status_code_of(res), StatusCode::OK);
@@ -40,7 +40,7 @@ async fn health_file_mode_caught_up_is_healthy() {
 
 #[tokio::test]
 async fn health_file_mode_lagging_is_degraded() {
-    // durable is far behind write_pos -> degraded + 503
+    
     let s = state("file", 1024, 2048, 2_000_000, 0);
     let res = health_handler(State(s)).await.into_response();
     assert_eq!(status_code_of(res), StatusCode::SERVICE_UNAVAILABLE);

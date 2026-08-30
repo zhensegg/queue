@@ -8,7 +8,7 @@ fn make_sub(tx: tokio::sync::mpsc::UnboundedSender<Arc<Vec<u8>>>, id: u64) -> Ar
 
 #[test]
 fn submap_new_normalizes_shard_count() {
-    // n rounds up to next power of two; even a small n must produce a valid map
+    
     let map = SubMap::new(3);
     let _ = map.read(b"topic").get(b"topic".as_slice());
     let map2 = SubMap::new(0);
@@ -21,7 +21,7 @@ fn test_shard_hash_is_deterministic() {
     let m2 = SubMap::new(64);
     assert_eq!(m1.idx(b"orders"), m2.idx(b"orders"));
     assert_eq!(m1.idx(b""), m2.idx(b""));
-    // equal topics must map to the same shard index
+    
     assert_eq!(m1.idx(b"abc"), m1.idx(b"abc"));
 }
 
@@ -30,7 +30,6 @@ fn test_subscribe_adds_and_reads_subscribers() {
     let subs = SubMap::new(64);
     let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<Arc<Vec<u8>>>();
 
-    // subscribe one connection to two topics
     {
         let mut g = subs.write(b"orders");
         g.entry(b"orders".to_vec()).or_default().push(make_sub(tx.clone(), 1));
@@ -40,13 +39,11 @@ fn test_subscribe_adds_and_reads_subscribers() {
         g.entry(b"shipments".to_vec()).or_default().push(make_sub(tx.clone(), 1));
     }
 
-    // reading back returns the subscriber
     let g = subs.read(b"orders");
     let list = g.get(b"orders".as_slice()).expect("topic present");
     assert_eq!(list.len(), 1);
     assert_eq!(list[0].id, 1);
 
-    // unrelated topic has no subscribers
     let g2 = subs.read(b"none");
     assert!(g2.get(b"none".as_slice()).is_none());
     drop(rx);
@@ -87,7 +84,6 @@ fn test_fanout_delivers_to_all_subscribers() {
         list.push(make_sub(tx2, 2));
     }
 
-    // emulate a published frame forwarded to every subscriber
     let frame = Arc::new(b"data".to_vec());
     {
         let g = subs.read(b"notifications");
@@ -100,7 +96,7 @@ fn test_fanout_delivers_to_all_subscribers() {
 
     assert_eq!(rx1.try_recv().unwrap().as_slice(), b"data");
     assert_eq!(rx2.try_recv().unwrap().as_slice(), b"data");
-    assert!(rx1.try_recv().is_err()); // exactly one message each
+    assert!(rx1.try_recv().is_err()); 
     assert!(rx2.try_recv().is_err());
 }
 
@@ -117,7 +113,6 @@ fn test_unsubscribe_removes_by_id() {
         list.push(make_sub(tx2, 2));
     }
 
-    // connection 1 disconnects
     {
         let mut g = subs.write(b"t");
         if let Some(list) = g.get_mut(b"t".as_slice()) {

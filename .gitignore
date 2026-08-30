@@ -30,3 +30,6 @@ desktop.ini
 
 # Rust toolchain / generated
 *.rs.bk
+
+# dev scripts stay on disk, never tracked
+/scripts/

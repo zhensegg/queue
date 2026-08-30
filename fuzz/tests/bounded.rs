@@ -1,10 +1,3 @@
-//! Bounded protocol fuzz pass wired into the crate's normal test suite.
-//!
-//! Runs the same coverage-guided parser fuzzer that the container drives, but
-//! for a fixed small iteration budget so it terminates quickly in CI. Any
-//! parser panic surfaces as a test failure (with the crashing input retained in
-//! the scratch crash dir).
-
 use std::time::Instant;
 
 use zhensegg_fuzz::{fuzzer, proto};
@@ -18,9 +11,7 @@ fn parser_fuzz_smoke_no_crash() {
     std::fs::create_dir_all(&corpus).unwrap();
 
     let seeds = proto::seed_corpus();
-    // Bounded: ~1s of wall time, capped at a modest iteration count, so this
-    // stays fast and deterministic-ish in CI while still covering real parser
-    // behaviour.
+    
     let deadline = Instant::now() + std::time::Duration::from_secs(1);
     let mut remaining = 120_000u64;
     while remaining > 0 && Instant::now() < deadline {

@@ -1,11 +1,3 @@
-//! Per-connection processing: auth gate, parser loop, publish/subscribe/fetch,
-//! outbound fan-out.
-//!
-//! The work lives in [`conn_core`], generic over the read/write halves so the
-//! same code drives both a plain TCP connection (`into_split`, zero shared
-//! state) and a TLS connection (`tokio::io::split`). Authentication and TLS
-//! handoff happen once, up front, and never touch the steady-state hot loop.
-
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -14,10 +6,9 @@ use tracing::debug;
 use crate::metrics::Metrics;
 use crate::protocol::{encode_ack, encode_data, Op, Parser as ZParser};
 use crate::security::AccessControl;
-use crate::store::Store;
+use crate::store::{wait_durable, Store};
 use crate::subscription::{Subscriber, SubscriberMap};
 
-// ===== provided-buffers style slab: per-thread free-list, zero alloc on hot path =====
 thread_local! {
     static BUF_POOL: std::cell::RefCell<Vec<Vec<u8>>> = const { std::cell::RefCell::new(Vec::new()) };
 }
@@ -25,7 +16,6 @@ thread_local! {
 fn take_buf(min: usize) -> Vec<u8> {
     BUF_POOL.with(|p| {
         let mut pool = p.borrow_mut();
-        // scan from end (most recently freed = hot in cache)
         for i in (0..pool.len()).rev() {
             if pool[i].capacity() >= min {
                 return pool.swap_remove(i);
@@ -48,9 +38,7 @@ fn give_buf(mut b: Vec<u8>) {
     }
 }
 
-/// Handle one plain (non-TLS) tokio connection. Uses `into_split` owned halves
-/// for the zero-overhead hot path. `auth_timeout` bounds how long a connection
-/// may stay unauthenticated before it is dropped (None = unlimited).
+#[allow(clippy::too_many_arguments)]
 pub async fn handle_tokio_conn(
     stream: tokio::net::TcpStream,
     id: u64,
@@ -59,14 +47,14 @@ pub async fn handle_tokio_conn(
     metrics: Arc<Metrics>,
     auth: AccessControl,
     auth_timeout: Option<Duration>,
+    durable_acks: bool,
+    durable_ack_timeout: Duration,
 ) -> std::io::Result<()> {
     let (read_half, write_half) = stream.into_split();
-    conn_core(read_half, write_half, id, store, subs, metrics, auth, auth_timeout).await
+    conn_core(read_half, write_half, id, store, subs, metrics, auth, auth_timeout, durable_acks, durable_ack_timeout).await
 }
 
-/// Handle one TLS-terminated tokio connection (already handshaken by the accept
-/// loop). `tokio::io::split` is used because `TlsStream` has no owned halfs.
-/// `auth_timeout` bounds how long a connection may stay unauthenticated.
+#[allow(clippy::too_many_arguments)]
 pub async fn handle_tls_conn(
     stream: tokio_rustls::server::TlsStream<tokio::net::TcpStream>,
     id: u64,
@@ -75,12 +63,13 @@ pub async fn handle_tls_conn(
     metrics: Arc<Metrics>,
     auth: AccessControl,
     auth_timeout: Option<Duration>,
+    durable_acks: bool,
+    durable_ack_timeout: Duration,
 ) -> std::io::Result<()> {
     let (read_half, write_half) = tokio::io::split(stream);
-    conn_core(read_half, write_half, id, store, subs, metrics, auth, auth_timeout).await
+    conn_core(read_half, write_half, id, store, subs, metrics, auth, auth_timeout, durable_acks, durable_ack_timeout).await
 }
 
-/// Core connection driver, generic over the transport halves.
 #[allow(clippy::too_many_arguments)]
 pub async fn conn_core<R, W>(
     mut read_half: R,
@@ -91,6 +80,8 @@ pub async fn conn_core<R, W>(
     metrics: Arc<Metrics>,
     auth: AccessControl,
     auth_timeout: Option<Duration>,
+    durable_acks: bool,
+    durable_ack_timeout: Duration,
 ) -> std::io::Result<()>
 where
     R: tokio::io::AsyncRead + Unpin + Send + 'static,
@@ -101,28 +92,23 @@ where
 
     metrics.connections_total.inc();
 
-    // writer task: batched zero-copy flush (single write per batch)
     let writer = tokio::spawn(async move {
         let mut pending: Vec<Arc<Vec<u8>>> = Vec::with_capacity(128);
         loop {
-            // wait for at least one message
             let first = rx.recv().await;
             if first.is_none() {
                 break;
             }
             pending.push(first.unwrap());
-            // drain additional without blocking, up to 256 for higher batching
             while pending.len() < 256 {
                 match rx.try_recv() {
                     Ok(m) => pending.push(m),
                     Err(_) => break,
                 }
             }
-            // coalesce into single buffer for one syscall (smart batching)
             let total: usize = pending.iter().map(|v| v.len()).sum();
             let mut out = take_buf(total);
             for m in pending.drain(..) {
-                // recycle buffer backing if this is the last Arc holder (provided-buffers style)
                 if Arc::strong_count(&m) == 1 {
                     match Arc::try_unwrap(m) {
                         Ok(raw) => {
@@ -142,7 +128,6 @@ where
         }
     });
 
-    // ---- auth gate: run before any data-plane command is honoured ----
     let mut authenticated = auth.initially_authenticated();
 
     let mut parser = ZParser::new(64 * 1024);
@@ -162,8 +147,6 @@ where
                             "authentication timeout",
                         ));
                     }
-                    // Bound the read itself so a silent client cannot stall the
-                    // auth phase forever.
                     match tokio::time::timeout(deadline - now, read_half.read(&mut read_buf)).await {
                         Ok(Ok(n)) => n,
                         Ok(Err(e)) => return Err(e),
@@ -186,7 +169,6 @@ where
             }
             parser.feed(&read_buf[..n]);
             while let Some(frame) = parser.try_parse() {
-                // Every unauthenticated connection may only send an Auth frame.
                 if !authenticated {
                     if frame.op != Op::Auth {
                         metrics.auth_failures_total.inc();
@@ -224,6 +206,22 @@ where
                         metrics.append_latency
                             .with_label_values(&["disk"])
                             .observe(t0.elapsed().as_secs_f64());
+
+                        if durable_acks
+                            && let Some(gate) = store.durable_gate()
+                        {
+                            let need = offset + rec_len as u64;
+                            if gate.pos() < need {
+                                let wait = wait_durable(gate, need);
+                                if tokio::time::timeout(durable_ack_timeout, wait).await.is_err() {
+                                    return Err(std::io::Error::new(
+                                        std::io::ErrorKind::TimedOut,
+                                        "durable ack timeout (flusher stalled); closing without ack",
+                                    ));
+                                }
+                            }
+                        }
+
                         metrics.messages_total.with_label_values(&["published"]).inc();
                         metrics.messages_bytes_total.with_label_values(&["published"]).inc_by(payload_slice.len() as f64);
 
@@ -285,7 +283,6 @@ where
                         let _ = tx.send(Arc::new(pong));
                     }
                     Op::Auth => {
-                        // Re-auth is a no-op for an already authenticated connection.
                         let mut ack = Vec::with_capacity(32);
                         encode_ack(&mut ack, b"auth", 0, 0);
                         let _ = tx.send(Arc::new(ack));
@@ -298,7 +295,6 @@ where
     }
     .await;
 
-    // cleanup subscriptions (per-topic shard lock)
     for t in my_topics {
         let mut g = subs.write(&t);
         if let Some(list) = g.get_mut(&t) {
@@ -310,7 +306,6 @@ where
         metrics.subscriptions_total.dec();
     }
     metrics.connections_total.dec();
-    // close writer channel to terminate writer task
     drop(tx);
     let _ = writer.await;
     res

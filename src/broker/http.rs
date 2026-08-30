@@ -1,9 +1,3 @@
-//! HTTP sidecar: /metrics, /health, /ready endpoints (axum) on a separate port.
-//!
-//! The admin plane can be protected with an optional token (Basic auth) and/or
-//! restricted to loopback. The token is read from [`SharedSecurity`] on each
-//! request so a `SIGHUP` rotation applies immediately.
-
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::Arc;
 
@@ -21,10 +15,6 @@ use crate::health::HealthState;
 use crate::metrics::Metrics;
 use crate::security::{SharedSecurity, secure_eq};
 
-/// Check whether an incoming admin-plane request is authorized. Reads the
-/// current admin token from `sec` on every call (so a SIGHUP rotation applies
-/// immediately), and compares it in constant time against the Basic-auth
-/// credentials. With no token configured, every request passes.
 pub fn is_admin_authorized(sec: &SharedSecurity, req: &Request) -> bool {
     match sec.http_token() {
         None => true,
@@ -44,7 +34,6 @@ pub fn is_admin_authorized(sec: &SharedSecurity, req: &Request) -> bool {
     }
 }
 
-/// Serve the metrics/health/ready HTTP endpoints until bind/serve error.
 pub async fn metrics_http_server(config: Config, health_state: HealthState, sec: Arc<SharedSecurity>) {
     #[derive(Clone)]
     struct AppState {
@@ -66,8 +55,6 @@ pub async fn metrics_http_server(config: Config, health_state: HealthState, sec:
         (StatusCode::OK, "ok")
     }
 
-    // Basic-auth middleware for the admin plane. Reads the current admin token
-    // from SharedSecurity on every request (so a SIGHUP rotation applies).
     let auth_layer = axum::middleware::from_fn(move |req: Request, next: Next| {
         let sec = sec.clone();
         async move {
@@ -102,7 +89,7 @@ pub async fn metrics_http_server(config: Config, health_state: HealthState, sec:
         }
     };
     if config.http_loopback_only {
-        // Force a loopback bind (keep the configured port).
+        
         addr.set_ip(IpAddr::V4(Ipv4Addr::LOCALHOST));
     }
     let listener = match tokio::net::TcpListener::bind(addr).await {

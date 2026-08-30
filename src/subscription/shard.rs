@@ -1,5 +1,3 @@
-//! Sharded subscriber map (FNV-1a, 64 shards) — hot path takes 1 shard read lock, no global contention.
-
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -23,7 +21,7 @@ impl SubMap {
 
     #[inline]
     pub fn idx(&self, topic: &[u8]) -> usize {
-        // FNV-1a 64
+        
         let mut h: u64 = 0xcbf2_9ce4_8422_2325;
         for &b in topic {
             h ^= b as u64;

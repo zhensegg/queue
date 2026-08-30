@@ -97,7 +97,7 @@ fn encode_fetch_embeds_offset_in_payload() {
     parser.feed(&buf);
     let frame = parser.try_parse().unwrap();
     assert_eq!(frame.op, Op::Fetch);
-    // Fetch embeds offset+len in the 12-byte payload
+    
     assert_eq!(frame.payload.len(), 12);
     let off = u64::from_be_bytes(frame.payload[0..8].try_into().unwrap());
     let len = u32::from_be_bytes(frame.payload[8..12].try_into().unwrap());

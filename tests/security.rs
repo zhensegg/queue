@@ -1,7 +1,3 @@
-//! Tests for the security module: constant-time token comparison, access
-//! control policy, and a full TLS handshake + publish round-trip over a
-//! self-signed certificate chain generated on the fly with `rcgen`.
-
 use std::io::Cursor;
 use std::sync::Arc;
 
@@ -15,10 +11,6 @@ use zhensegg::protocol::{Op, Parser, encode_auth, encode_publish};
 use zhensegg::security::{AccessControl, build_tls_acceptor, secure_eq};
 use zhensegg::store::{MemRing, Store};
 use zhensegg::subscription::{SubMap, SubscriberMap};
-
-// ---------------------------------------------------------------------------
-// Unit tests: no IO.
-// ---------------------------------------------------------------------------
 
 #[test]
 fn secure_eq_matches_exact_values() {
@@ -47,18 +39,13 @@ fn access_control_token_policy() {
     assert!(!ac.verify(b""));
 }
 
-// ---------------------------------------------------------------------------
-// TLS integration test: generate a self-signed cert, serve TLS, connect with a
-// rustls client, authenticate and publish over the encrypted channel.
-// ---------------------------------------------------------------------------
-
 async fn write_temp(path: &std::path::Path, contents: &str) {
     tokio::fs::write(path, contents).await.unwrap();
 }
 
 #[tokio::test]
 async fn tls_handshake_and_auth_publish_roundtrip() {
-    // Install the ring provider so both server and client use it.
+    
     rustls::crypto::ring::default_provider().install_default().ok();
 
     let certified = rcgen::generate_simple_self_signed(vec!["localhost".to_string()])
@@ -73,12 +60,9 @@ async fn tls_handshake_and_auth_publish_roundtrip() {
     write_temp(&cert_path, &cert_pem).await;
     write_temp(&key_path, &key_pem).await;
 
-    // Build the TLS acceptor the broker would use.
     let acceptor = build_tls_acceptor(cert_path.to_str().unwrap(), key_path.to_str().unwrap())
         .expect("build acceptor");
 
-    // Broker side: store, subs, metrics, and a listener that handshakes TLS
-    // before dispatching to handle_tls_conn (mirrors accept_loop + handle_tls_conn).
     let store: Arc<dyn Store> = Arc::new(MemRing::new(1024 * 1024));
     let subs: SubscriberMap = Arc::new(SubMap::new(64));
     let metrics = Arc::new(Metrics::new());
@@ -89,10 +73,9 @@ async fn tls_handshake_and_auth_publish_roundtrip() {
     let server = tokio::spawn(async move {
         let (socket, _) = listener.accept().await.unwrap();
         let tls_stream = acceptor.accept(socket).await.expect("server tls handshake");
-        let _ = handle_tls_conn(tls_stream, 1, store, subs, metrics, auth, None).await;
+        let _ = handle_tls_conn(tls_stream, 1, store, subs, metrics, auth, None, false, std::time::Duration::from_secs(10)).await;
     });
 
-    // Client side: trust the self-signed cert as its own root.
     let mut roots = RootCertStore::empty();
     let mut buf = Cursor::new(cert_pem.into_bytes());
     let der = rustls_pemfile::certs(&mut buf).next().unwrap().unwrap();
@@ -106,7 +89,6 @@ async fn tls_handshake_and_auth_publish_roundtrip() {
     let name = rustls::pki_types::ServerName::try_from("localhost").unwrap();
     let mut tls = connector.connect(name, tcp).await.expect("client tls handshake");
 
-    // Read one protocol frame from the TLS stream, returning op + topic + payload.
     async fn read_frame<S>(stream: &mut S, parser: &mut Parser, rbuf: &mut [u8]) -> (Op, Vec<u8>, Vec<u8>)
     where
         S: tokio::io::AsyncRead + Unpin,
@@ -126,7 +108,6 @@ async fn tls_handshake_and_auth_publish_roundtrip() {
     let mut parser = Parser::new(4096);
     let mut rbuf = vec![0u8; 8192];
 
-    // Authenticate over the encrypted channel.
     let mut auth_frame = Vec::new();
     encode_auth(&mut auth_frame, b"tls-token");
     tls.write_all(&auth_frame).await.unwrap();
@@ -134,14 +115,12 @@ async fn tls_handshake_and_auth_publish_roundtrip() {
     assert_eq!(op, Op::Ack);
     assert_eq!(topic, b"auth".as_slice());
 
-    // Publish after authentication; expect an ack back.
     let mut pub_frame = Vec::new();
     encode_publish(&mut pub_frame, b"tls-topic", b"encrypted-payload");
     tls.write_all(&pub_frame).await.unwrap();
     let (op, _topic, _p) = read_frame(&mut tls, &mut parser, &mut rbuf).await;
     assert_eq!(op, Op::Ack);
 
-    // Close the client connection so the server-side handler sees EOF and returns.
     drop(tls);
     server.await.unwrap();
     let _ = std::fs::remove_dir_all(&dir);

@@ -6,7 +6,7 @@ fn test_memring_append_read_roundtrip() {
     let (off, len) = ring.append(b"topic", b"hello").unwrap();
     let mut out = Vec::new();
     ring.read(off, len, &mut out).unwrap();
-    // out contains raw record: [4 topic_len][4 payload_len][topic][payload]
+    
     assert!(out.len() >= 8 + 5 + 5);
     let tl = u32::from_be_bytes([out[0], out[1], out[2], out[3]]) as usize;
     let pl = u32::from_be_bytes([out[4], out[5], out[6], out[7]]) as usize;

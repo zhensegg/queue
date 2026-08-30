@@ -1,6 +1,5 @@
 use super::{Op, LEN_PREFIX};
 
-/// Encode a frame into provided buffer (reusable). Returns number of bytes written.
 pub fn encode_frame(buf: &mut Vec<u8>, op: Op, topic: &[u8], payload: &[u8]) {
     let total_len = 1 + 4 + 4 + topic.len() + payload.len();
     buf.reserve(LEN_PREFIX + total_len);
@@ -45,7 +44,6 @@ pub fn encode_data(buf: &mut Vec<u8>, topic: &[u8], payload: &[u8]) {
     encode_frame(buf, Op::Data, topic, payload);
 }
 
-/// Encode an authentication frame carrying `token` in the payload.
 pub fn encode_auth(buf: &mut Vec<u8>, token: &[u8]) {
     encode_frame(buf, Op::Auth, b"auth", token);
 }

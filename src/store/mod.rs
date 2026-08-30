@@ -1,8 +1,8 @@
-//! Ring-buffer store: in-memory and persistent (with background flusher).
-
 mod mem;
+pub mod durable;
 pub mod file;
 pub mod flusher;
 
-pub use mem::{MemRing, Store, StoreError};
+pub use durable::{wait_durable, DurableGate, WaitDurable};
 pub use file::FileRing;
+pub use mem::{MemRing, Store, StoreError};

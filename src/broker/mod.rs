@@ -1,6 +1,3 @@
-//! Broker module: TCP accept loop, per-connection protocol handling, socket setup,
-//! lifecycle orchestration and the HTTP sidecar.
-
 mod accept;
 pub mod connection;
 pub mod http;
