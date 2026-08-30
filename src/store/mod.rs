@@ -193,12 +193,13 @@ pub mod file_ring {
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::sync::Arc;
 
-    /// Persistent ring with async group-commit.
-    /// Append is lock-free to MemRing (RAM) for >2M RPS, background flusher does batched pwrite.
-    /// This gives durability with ~1ms commit latency and no per-message fsync bottleneck.
-    /// For true O_DIRECT + fsync per batch, set `use_direct=true` (slower for small msgs).
+    /// Persistent ring with async group-commit (step10).
+    /// Append is lock-free to MemRing (RAM). Background flusher drains new records
+    /// [flushed_pos .. write_pos-64KB] and does batched pwrite to file (page cache),
+    /// then fdatasync every ~2ms (group commit). File layout == MemRing layout,
+    /// so file offset = logical offset % capacity.
     pub struct FileRing {
-        inner: MemRing,
+        inner: Arc<MemRing>,
         file: Arc<parking_lot::Mutex<File>>,
         capacity: usize,
         flushed_pos: AtomicU64,
@@ -217,35 +218,65 @@ pub mod file_ring {
             unsafe { libc::posix_fadvise(file.as_raw_fd(), 0, 0, libc::POSIX_FADV_SEQUENTIAL); }
             #[cfg(target_os = "linux")]
             try_register_file(&file);
-            let inner = MemRing::new(cap);
+            let inner = Arc::new(MemRing::new(cap));
             let file_arc = Arc::new(parking_lot::Mutex::new(file));
-            let file_clone = file_arc.clone();
-            // We need a raw pointer to inner for background thread without lifetime issues.
-            // Instead, we will use a separate channel: the background thread will poll inner via Arc.
-            // To avoid lifetime, we leak inner pointer? Better to use Arc<MemRing>?
-            // Simplify: store inner in Arc and share with flusher via static Once.
-            // For MVP, we spawn a thread that does NOT read from inner, just periodically fdatasync file (group commit).
-            // The actual data is written via pwrite in append path but batched? No, we make append fast (mem only) and file flush is async.
-            // For now, we just keep file handle and spawn a thread that periodically syncs.
-            let flush_file = file_clone.clone();
+            let flushed = Arc::new(AtomicU64::new(0));
+
+            // step10: real persistence - drain ring -> batched pwrite -> group fdatasync
+            let flush_file = file_arc.clone();
+            let flush_inner = inner.clone();
+            let flush_flushed = flushed.clone();
+            let flush_cap = cap;
             let handle = std::thread::Builder::new()
                 .name("zhensegg-flusher".into())
                 .spawn(move || {
+                    let mut buf: Vec<u8> = Vec::with_capacity(256 * 1024);
+                    let mut last_sync = std::time::Instant::now();
+                    let fd = flush_file.lock().as_raw_fd();
                     loop {
-                        std::thread::sleep(std::time::Duration::from_millis(2));
-                        // group commit: fdatasync every 2ms (batch)
-                        if let Some(f) = flush_file.try_lock() {
-                            let _ = unsafe { libc::fdatasync(f.as_raw_fd()) };
+                        std::thread::sleep(std::time::Duration::from_millis(1));
+                        let wpos = flush_inner.write_pos();
+                        let mut fpos = flush_flushed.load(Ordering::Relaxed);
+                        // overwritten before flushed? skip ahead
+                        if wpos - fpos > flush_cap as u64 {
+                            fpos = wpos - (flush_cap as u64) / 2;
+                            flush_flushed.store(fpos, Ordering::Relaxed);
+                        }
+                        // safety margin: never flush torn record region (appends may be in flight)
+                        let target = wpos.saturating_sub(64 * 1024);
+                        if target <= fpos {
+                            if last_sync.elapsed() >= std::time::Duration::from_millis(2) {
+                                let _ = unsafe { libc::fdatasync(fd) };
+                                last_sync = std::time::Instant::now();
+                            }
+                            continue;
+                        }
+                        let chunk = ((target - fpos) as usize).min(256 * 1024);
+                        if flush_inner.read(fpos, chunk as u32, &mut buf).is_err() {
+                            continue;
+                        }
+                        // pwrite at mirrored offset; handle ring-boundary wrap with two writes
+                        let file_off = (fpos as usize) % flush_cap;
+                        let mut data = &buf[..chunk];
+                        if file_off + chunk <= flush_cap {
+                            let ret = unsafe { libc::pwrite(fd, data.as_ptr() as *const libc::c_void, data.len(), file_off as i64) };
+                            if ret < 0 { continue; }
+                        } else {
+                            let first = flush_cap - file_off;
+                            let ret = unsafe { libc::pwrite(fd, data.as_ptr() as *const libc::c_void, first, file_off as i64) };
+                            if ret < 0 { continue; }
+                            data = &data[first..];
+                            let ret = unsafe { libc::pwrite(fd, data.as_ptr() as *const libc::c_void, data.len(), 0) };
+                            if ret < 0 { continue; }
+                        }
+                        flush_flushed.store(fpos + chunk as u64, Ordering::Relaxed);
+                        if last_sync.elapsed() >= std::time::Duration::from_millis(2) {
+                            let _ = unsafe { libc::fdatasync(fd) };
+                            last_sync = std::time::Instant::now();
                         }
                     }
                 })
                 .ok();
-
-            // Note: we are not actually writing data to file per append for speed.
-            // For true persistence, we would copy from inner ring to file in batches.
-            // For MVP benchmark, we simulate persisted with periodic fdatasync and rely on page cache.
-            // To actually persist, we could lazily write: the flusher would read from inner and pwrite.
-            // For now, we provide a wrapper that delegates to inner for append/read and does async sync.
 
             Ok(Self {
                 inner,
