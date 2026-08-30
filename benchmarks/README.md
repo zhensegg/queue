@@ -1,45 +1,43 @@
 # Zhensegg Benchmark
 
-Honest production benchmark harness for the Zhensegg broker. Moved out of
-`src/bin/bench.rs` into a standalone crate under `benchmarks/` so it builds and
-runs independently of the broker library/binary.
+Honest production benchmark harness for the Zhensegg broker: standalone crate
+under `benchmarks/`, builds and runs independently of the broker library.
+
+Measured results, methodology and the kill -9 stress live in
+[docs/BENCHMARKS.md](../docs/BENCHMARKS.md).
 
 ## Layout
 
 ```
 benchmarks/
   Cargo.toml         standalone crate (depends on ../ via path)
-  src/main.rs        the benchmark client
+  src/main.rs        the benchmark client (+ --verify-ring crash auditor)
   Dockerfile         multi-stage: builds broker (--features uring) + bench on Linux
   run-bench.sh       container entrypoint: starts broker in file mode, runs bench
 ```
 
-## What it measures (honestly)
+## What it measures
 
-* **Closed loop** — a producer never sends the next batch until the broker has
-  ACKed the previous one. Throughput is counted on ACKs **only**, never on
-  "bytes written to the socket", so the RPS reflects real sustained capacity.
-* **Separate OS threads** — every producer and every consumer runs on its own
-  OS thread (each with its own tokio current-thread runtime and its own TCP
-  connection). This is the production topology, not multiplexed tasks.
-* **E2E delivery latency** — the first 8 bytes of each payload carry a nanosecond
-  timestamp written by the producer; consumers measure publish→delivery.
-* **Durability on media** — in file mode, sampled ACKed records are re-read
-  straight off the ring file with `O_DIRECT` (bypassing the page cache) and
-  compared byte-for-byte to what the producer sent. A mismatch where the ring
-  has not yet wrapped is a durability violation.
+* **Closed loop, acked-only** — a producer never sends the next batch until the
+  broker ACKed the previous one; with durable group-commit an ACK means the
+  record and the ring header are on media.
+* **Separate OS threads** — every producer/consumer on its own thread and TCP
+  connection (production topology).
+* **E2E delivery latency** — first 8 payload bytes carry a producer timestamp.
+* **Durability on media** — sampled ACKed records re-read with `O_DIRECT` and
+  compared byte-for-byte (v2 header offset applied).
+* **`--verify-ring <file>`** — standalone O_DIRECT auditor: walks the record
+  chain and requires it to reach the header `committed` position exactly
+  (re-syncing across generation seams); used for the kill -9 stress.
 
 ## Run locally (no container)
 
 ```bash
-# build once
 cd benchmarks && cargo build --release
 
-# start a broker in persistent file mode
 cargo run --release --bin zhensegg-broker -- \
     --mode file --file /tmp/zhensegg.ring --ring-capacity-mb 4096 --cores 4
 
-# run the bench against it (producers + consumers on separate threads)
 ./benchmarks/target/release/zhensegg-bench \
     --addr 127.0.0.1:9090 --producers 8 --consumers 8 \
     --payload-size 256 --secs 30 --verify-file /tmp/zhensegg.ring
@@ -47,17 +45,12 @@ cargo run --release --bin zhensegg-broker -- \
 
 ## Run in Docker (Ubuntu, io_uring path)
 
-Note: the real io_uring store path is always active on Linux (the flusher uses
-`pwrite`/`fdatasync`; the `io-uring` crate is a Linux-target dependency). The
-`--features uring` flag additionally compiles monoio, as requested.
-
 ```bash
-# 1. build the image (broker + bench for Linux in one multi-stage build)
 docker build -f benchmarks/Dockerfile -t zhensegg-bench .
-
-# 2. run the persistent file-mode benchmark
 docker run --rm zhensegg-bench
 ```
+
+If Docker's seccomp profile blocks io_uring, add `--privileged`.
 
 Tunable via env vars:
 
@@ -74,37 +67,3 @@ Tunable via env vars:
 | `PAYLOAD`      | 256        | Payload bytes (>=8)                          |
 | `MSGS`         | 0          | Fixed message count (0 = run by seconds)     |
 | `SECS`         | 30         | Duration in seconds                          |
-
-If Docker's default seccomp profile blocks io_uring, run with
-`--privileged` (or `--security-opt seccomp=unconfined`).
-
-```bash
-docker run --rm --privileged zhensegg-bench
-```
-
-## Results (Ubuntu 24.04 container on Docker Desktop/WSL2, file mode)
-
-### Persistent soak — 30 s, 8 producers × 8 consumers, 256 B payload, 4 GB ring, 4 cores
-
-| Metric                        | Value            |
-|-------------------------------|------------------|
-| Publish RPS (closed-loop, acked-only) | **~600K msg/s** |
-| Publish throughput            | ~154 MB/s        |
-| Delivery RPS (consumers)      | ~4.8M msg/s      |
-| Backlog after run             | 0% (fully drained) |
-| pub→ack batch RTT             | p50=1.18 ms, p90=8.4 ms, p99=10.0 ms, p99.9=44.8 ms |
-| e2e delivery latency (144M samples) | p50=1.82 ms, p90=7.4 ms, p99=9.6 ms, p99.9=10.7 ms |
-| Durability (O_DIRECT on media)| **4096/4096 verified, 0 mismatch** |
-
-### Latency-focused — 8 s, 4 producers × 4 consumers, 1-in-flight (batch=1), 128 B payload
-
-| Metric                        | Value            |
-|-------------------------------|------------------|
-| pub→ack RTT                   | p50=37 µs, p90=168 µs, p99=315 µs, p99.9=504 µs |
-| e2e delivery latency (1.6M samples) | p50=72 µs, p90=218 µs, p99=659 µs, p99.9=931 µs |
-| Throughput (latency-bound)    | ~50K msg/s aggregate        |
-
-The absolute numbers above are from a Docker Desktop (WSL2) sandbox on Windows;
-on bare-metal Linux hardware the closed-loop RPS and latencies are expected to
-be better. The closed-loop acked-only rate is the honest production figure
-because no optimistically-counted messages are included.

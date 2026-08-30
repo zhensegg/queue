@@ -6,7 +6,7 @@
 #          (--privileged only helps if seccomp blocks io_uring on the host)
 
 # ---- stage 1: build ----
-FROM rust:1.85-bookworm AS build
+FROM rust:1.97-bookworm AS build
 WORKDIR /work
 
 # copy manifests first for better layer caching

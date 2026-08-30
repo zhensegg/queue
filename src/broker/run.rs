@@ -43,9 +43,9 @@ pub fn run_broker(config: Config) -> anyhow::Result<()> {
                 {
                     use tokio::signal::unix::{SignalKind, signal};
                     
-                    let mut hup = signal(SignalKind::hangup()).expect("sighup");
-                    let mut term = signal(SignalKind::terminate()).expect("sigterm");
-                    let mut int = signal(SignalKind::interrupt()).expect("sigint");
+                    let hup = signal(SignalKind::hangup()).expect("sighup");
+                    let term = signal(SignalKind::terminate()).expect("sigterm");
+                    let int = signal(SignalKind::interrupt()).expect("sigint");
                     let _ = signal_ready_tx.send(());
                     tokio::pin!(hup);
                     tokio::pin!(term);
@@ -105,17 +105,31 @@ pub fn run_broker(config: Config) -> anyhow::Result<()> {
 
     let metrics = Arc::new(Metrics::new());
     let subs: SubscriberMap = Arc::new(SubMap::new(64));
+    let reject_overflow = config.on_overflow.eq_ignore_ascii_case("reject");
+    store.set_reject_overflow(reject_overflow);
+    store.attach_watermark(subs.retention.clone());
+    if reject_overflow {
+        info!("overflow policy: reject (publishes NACKed instead of overwriting undelivered data)");
+    }
 
     let store_usage = Arc::new(AtomicU64::new(0));
     let write_pos_atomic = Arc::new(AtomicU64::new(0));
     let durable_pos_atomic = Arc::new(AtomicU64::new(0));
+    let seconds_to_wrap_ms = Arc::new(AtomicU64::new(u64::MAX));
+    let store_capacity_bytes = if config.is_file_mode() {
+        config.ring_capacity_bytes()
+    } else {
+        config.mem_capacity_bytes()
+    };
 let health_state = HealthState {
         metrics: metrics.clone(),
         store_type: config.mode.clone(),
-        store_capacity_mb: (config.ring_capacity_bytes() as u64 / (1024 * 1024)),
+        store_capacity_mb: (store_capacity_bytes as u64 / (1024 * 1024)),
         store_usage_bytes: store_usage.clone(),
         write_pos: write_pos_atomic.clone(),
         durable_pos: durable_pos_atomic.clone(),
+        seconds_to_wrap_ms: seconds_to_wrap_ms.clone(),
+        overflow_reject: reject_overflow,
     };
 
     {
@@ -124,13 +138,35 @@ let health_state = HealthState {
         let durable_pos_atomic = durable_pos_atomic.clone();
         let store_usage = store_usage.clone();
         let metrics = metrics.clone();
-        std::thread::spawn(move || loop {
-            write_pos_atomic.store(store.write_pos(), Ordering::Relaxed);
-            durable_pos_atomic.store(store.durable_pos(), Ordering::Relaxed);
-            let usage = store.write_pos().saturating_sub(store.durable_pos());
-            store_usage.store(usage, Ordering::Relaxed);
-            metrics.store_usage_bytes.set(usage as f64);
-            std::thread::sleep(Duration::from_millis(200));
+        let seconds_to_wrap_ms = seconds_to_wrap_ms.clone();
+        std::thread::spawn(move || {
+            let mut last_wp = store.write_pos();
+            let mut last_t = std::time::Instant::now();
+            loop {
+                std::thread::sleep(Duration::from_millis(200));
+                let wp = store.write_pos();
+                let now = std::time::Instant::now();
+                let dt = now.duration_since(last_t).as_secs_f64();
+                let bytes_per_sec = if dt > 0.0 {
+                    ((wp.saturating_sub(last_wp)) as f64 / dt) as u64
+                } else {
+                    0
+                };
+                last_wp = wp;
+                last_t = now;
+                let cap = store_capacity_bytes as u64;
+                let remaining = cap.saturating_sub(wp % cap);
+                let stw = remaining
+                    .saturating_mul(1000)
+                    .checked_div(bytes_per_sec)
+                    .unwrap_or(u64::MAX);
+                seconds_to_wrap_ms.store(stw, Ordering::Relaxed);
+                durable_pos_atomic.store(store.durable_pos(), Ordering::Relaxed);
+                let usage = wp.saturating_sub(store.durable_pos());
+                store_usage.store(usage, Ordering::Relaxed);
+                metrics.store_usage_bytes.set(usage as f64);
+                write_pos_atomic.store(wp, Ordering::Relaxed);
+            }
         });
     }
 
@@ -159,6 +195,7 @@ let health_state = HealthState {
     Ok(())
 }
 
+#[cfg(not(unix))]
 async fn wait_for_shutdown_signal() {
     #[cfg(unix)]
     {

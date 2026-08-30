@@ -47,3 +47,7 @@ pub fn encode_data(buf: &mut Vec<u8>, topic: &[u8], payload: &[u8]) {
 pub fn encode_auth(buf: &mut Vec<u8>, token: &[u8]) {
     encode_frame(buf, Op::Auth, b"auth", token);
 }
+
+pub fn encode_error(buf: &mut Vec<u8>, topic: &[u8], message: &str) {
+    encode_frame(buf, Op::Error, topic, message.as_bytes());
+}

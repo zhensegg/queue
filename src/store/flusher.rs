@@ -1,4 +1,3 @@
-use std::io::{Seek, SeekFrom, Write};
 use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -132,7 +131,6 @@ fn flush_cycle(
             fpos += chunk as u64;
             *flushed = fpos;
         }
-        sync_file(file)?;
         encode_header(hdr, target, target);
         write_all_at(file, 0, hdr)?;
         sync_file(file)?;
@@ -174,6 +172,7 @@ fn write_all_at(
     }
     #[cfg(not(target_os = "linux"))]
     {
+        use std::io::{Seek, SeekFrom, Write};
         let mut f = file.lock();
         f.seek(SeekFrom::Start(off))?;
         f.write_all(data)

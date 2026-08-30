@@ -9,6 +9,7 @@ pub enum Op {
     Notify = 0x06,
     Data = 0x07,
     Auth = 0x08,
+    Error = 0x09,
 }
 
 impl Op {
@@ -22,6 +23,7 @@ impl Op {
             0x06 => Some(Op::Notify),
             0x07 => Some(Op::Data),
             0x08 => Some(Op::Auth),
+            0x09 => Some(Op::Error),
             _ => None,
         }
     }

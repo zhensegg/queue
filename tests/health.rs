@@ -16,6 +16,8 @@ fn state(store_type: &str, capacity_mb: u64, used: u64, write: u64, durable: u64
         store_usage_bytes: Arc::new(AtomicU64::new(used)),
         write_pos: Arc::new(AtomicU64::new(write)),
         durable_pos: Arc::new(AtomicU64::new(durable)),
+        seconds_to_wrap_ms: Arc::new(AtomicU64::new(u64::MAX)),
+        overflow_reject: false,
     }
 }
 

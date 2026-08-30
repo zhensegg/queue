@@ -1,13 +1,17 @@
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use parking_lot::RwLock;
 
 use super::Subscriber;
 
+pub const NO_SUBSCRIBERS: u64 = u64::MAX;
+
 pub struct SubMap {
     shards: Vec<RwLock<HashMap<Vec<u8>, Vec<Arc<Subscriber>>>>>,
     mask: usize,
+    pub retention: Arc<AtomicU64>,
 }
 
 impl SubMap {
@@ -16,6 +20,7 @@ impl SubMap {
         Self {
             shards: (0..n).map(|_| RwLock::new(HashMap::new())).collect(),
             mask: n - 1,
+            retention: Arc::new(AtomicU64::new(NO_SUBSCRIBERS)),
         }
     }
 
@@ -38,5 +43,33 @@ impl SubMap {
     #[inline]
     pub fn write(&self, topic: &[u8]) -> parking_lot::RwLockWriteGuard<'_, HashMap<Vec<u8>, Vec<Arc<Subscriber>>>> {
         self.shards[self.idx(topic)].write()
+    }
+
+    #[inline]
+    pub fn note_min_sent(&self, candidate: u64) {
+        let mut cur = self.retention.load(Ordering::Relaxed);
+        while candidate < cur {
+            match self.retention.compare_exchange_weak(cur, candidate, Ordering::Release, Ordering::Relaxed) {
+                Ok(_) => break,
+                Err(actual) => cur = actual,
+            }
+        }
+    }
+
+    pub fn recompute_min_sent(&self) -> u64 {
+        let mut min = NO_SUBSCRIBERS;
+        for shard in &self.shards {
+            let g = shard.read();
+            for list in g.values() {
+                for s in list {
+                    let v = s.sent.load(Ordering::Relaxed);
+                    if v < min {
+                        min = v;
+                    }
+                }
+            }
+        }
+        self.retention.store(min, Ordering::Release);
+        min
     }
 }

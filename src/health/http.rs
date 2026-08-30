@@ -17,6 +17,8 @@ pub struct HealthState {
     pub store_usage_bytes: Arc<AtomicU64>,
     pub write_pos: Arc<AtomicU64>,
     pub durable_pos: Arc<AtomicU64>,
+    pub seconds_to_wrap_ms: Arc<AtomicU64>,
+    pub overflow_reject: bool,
 }
 
 impl Default for HealthState {
@@ -28,6 +30,8 @@ impl Default for HealthState {
             store_usage_bytes: Arc::new(AtomicU64::new(0)),
             write_pos: Arc::new(AtomicU64::new(0)),
             durable_pos: Arc::new(AtomicU64::new(0)),
+            seconds_to_wrap_ms: Arc::new(AtomicU64::new(u64::MAX)),
+            overflow_reject: false,
         }
     }
 }
@@ -36,6 +40,12 @@ pub async fn health_handler(State(state): State<HealthState>) -> impl IntoRespon
     let used = state.store_usage_bytes.load(Ordering::Relaxed);
     let write_pos = state.write_pos.load(Ordering::Relaxed);
     let durable = state.durable_pos.load(Ordering::Relaxed);
+    let stw_ms = state.seconds_to_wrap_ms.load(Ordering::Relaxed);
+    let seconds_to_wrap = if stw_ms == u64::MAX {
+        None
+    } else {
+        Some(stw_ms as f64 / 1000.0)
+    };
 
     let store_write_ok = state.store_type != "file" || durable >= write_pos.saturating_sub(1024 * 1024);
     let status = if store_write_ok {
@@ -58,6 +68,8 @@ pub async fn health_handler(State(state): State<HealthState>) -> impl IntoRespon
             used_mb: used / (1024 * 1024),
             durable_pos: durable,
             write_pos,
+            seconds_to_wrap,
+            overflow_policy: if state.overflow_reject { "reject" } else { "overwrite" }.to_string(),
         },
         checks: Checks {
             store_write: if store_write_ok { "ok" } else { "fail" }.to_string(),

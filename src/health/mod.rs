@@ -23,6 +23,8 @@ pub struct StoreHealth {
     pub used_mb: u64,
     pub durable_pos: u64,
     pub write_pos: u64,
+    pub seconds_to_wrap: Option<f64>,
+    pub overflow_policy: String,
 }
 
 #[derive(Debug, Clone, Serialize)]

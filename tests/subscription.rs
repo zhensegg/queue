@@ -1,9 +1,10 @@
 use std::sync::Arc;
+use std::sync::atomic::AtomicU64;
 
 use zhensegg::subscription::{SubMap, Subscriber};
 
 fn make_sub(tx: tokio::sync::mpsc::UnboundedSender<Arc<Vec<u8>>>, id: u64) -> Arc<Subscriber> {
-    Arc::new(Subscriber { id, tx })
+    Arc::new(Subscriber { id, tx, sent: AtomicU64::new(0) })
 }
 
 #[test]

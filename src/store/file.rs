@@ -1,5 +1,6 @@
 use std::fs::{File, OpenOptions};
 use std::sync::Arc;
+use std::sync::atomic::AtomicU64;
 
 #[cfg(target_os = "linux")]
 use std::os::unix::io::AsRawFd;
@@ -243,6 +244,14 @@ impl Store for FileRing {
     fn sync_pending(&self, timeout: std::time::Duration) -> u64 {
         let target = self.inner.committed_pos();
         self.flusher.wait_for(target, timeout)
+    }
+
+    fn set_reject_overflow(&self, on: bool) {
+        self.inner.set_reject_overflow(on)
+    }
+
+    fn attach_watermark(&self, wm: Arc<AtomicU64>) {
+        self.inner.attach_watermark(wm)
     }
 }
 

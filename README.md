@@ -2,11 +2,11 @@
 
 # Zhensegg Queue
 
-**An extremely fast offset message broker in Rust.**
+**An extremely fast, honest message broker in Rust.**
 
-Zero-copy publish/consume · persistent file mode · fan-out · fetch-by-offset · Prometheus metrics
+Persistent ring · group-commit durability · fan-out · fetch-by-offset · TLS+auth · Prometheus
 
-*One ring buffer. Honest acks only.*
+*One ring buffer. An ACK means it's on disk.*
 
 </div>
 
@@ -16,55 +16,53 @@ Zero-copy publish/consume · persistent file mode · fan-out · fetch-by-offset 
 
 Most brokers make you choose between speed and durability. Zhensegg doesn't.
 
-- **Lock-free append to the bone.** Record reservation is an atomic `fetch_add`
-  over a fixed ring — concurrent producers write to disjoint regions, no shared
-  buffer, no lock storms at high RPS.
-- **io_uring / thread-per-core data path**: a zero-allocation wire parser over a
-  per-thread ring, group-commit `fdatasync` in the background flusher. Acks are
-  sent only after data is safely handed to the store.
-- **Mem ↔ file, one store trait.** RAM ring for max happens, persistent file ring
-  for real durability — same append/read API, swap with a flag.
-- **Boring operations, on purpose**: `/metrics`, `/health`, `/ready` out of the
-  box, hot config, core pinning via SO_REUSEPORT.
+- **Lock-free append to the bone.** Record reservation is one atomic
+  `fetch_add` over a fixed ring — concurrent producers write disjoint regions.
+  No shared-buffer lock storms.
+- **Durable group-commit, done right.** Data + the CRC durability header are
+  synced with a single `fdatasync`, and only then does the ACK go out. The
+  flusher batches whole socket reads per commit, so throughput stays high even
+  with every ACK on media.
+- **Crash-proven, not crash-hoped.** Fail-stop flusher, header-based recovery,
+  and a `kill -9` stress harness that re-reads the ring with `O_DIRECT` after
+  every kill: 18.5M acked records survived 10/10 kills, 0 corrupt.
+- **Boring ops, on purpose.** `/metrics`, `/health` (with `seconds_to_wrap`),
+  `/ready`, SIGHUP secret/cert rotation, connection caps, systemd unit —
+  built in, not bolted on.
 
 ## Performance
 
-Closed-loop, durable (file) — throughput counted on *broker acks only*,
-producers and consumers on separate threads, everything fighting for the same
-cores (worst case for a broker):
+Closed loop, throughput counted on *broker acks only*, producers and consumers
+on separate OS threads, everything fighting for the same cores (worst case for
+a broker):
 
-| metric            | value                |
-|-------------------|----------------------|
-| publish RPS       | **1.6M msg/s (min)** |
-| delivery RPS      | ~4.8M msg/s          |
-| pub→ack (1-in-flight) | p50 ≈ 50 µs, p99 ≈ 91 µs |
-| e2e delivery      | p50 ≈ 61 µs, p99 ≈ 5.3 ms (fan-out on same cores) |
+| mode                     | publish RPS        | notes                                      |
+|--------------------------|--------------------|--------------------------------------------|
+| durable file (group-commit) | **~660–695K msg/s** | 256 B payload, 10-min soak, disk-bound |
+| in-memory                | ~700K msg/s        | no-disk ceiling in the same VM             |
+| pub→ack RTT (batch=1)    | p50 ≈ 711 µs       | one full fdatasync per ack                 |
+| e2e delivery             | p50 ≈ 10 ms        | fan-out to 8 subscribers                   |
 
-> **Note on the numbers.** These figures were measured in a **WSL2 / Docker
-> container** where the sandbox alone ate most of the headroom — the same run
-> reported ~834K msg/s publish (with TLS + auth enabled, no regression vs plain
-> TCP) and 1-in-flight pub→ack p50 ≈ 50 µs. WSL2 adds a **2× (at minimum)
-> overhead**, so on dedicated bare-metal Linux hardware the honest closed-loop
-> rate is **1.6M msg/s and up**. Durability is verified byte-for-byte on media
-> (`O_DIRECT`, 4096/4096 records, 0 mismatch) so the RPS is *real*: every
-> counted message was actually persisted. See
-> [benchmarks/README.md](benchmarks/README.md).
+> **Note on the numbers.** Measured in a WSL2/Docker sandbox where the soak
+> sustains **~94% of the disk's measured raw `fdatasync` bandwidth** — the
+> disk is the bottleneck, not the broker. On dedicated bare-metal Linux with
+> NVMe, expect more; no inflated multiplier is quoted because the CPU-side
+> ceiling hasn't been independently measured yet. Durability is verified
+> byte-for-byte on media (`O_DIRECT`, 0 mismatches), so every counted message
+> was actually persisted. See [docs/BENCHMARKS.md](docs/BENCHMARKS.md).
 
 ## Killer features
 
-| Feature | Description |
-|---------|-------------|
-| **Zero-copy parser** | wire frames parsed without a single per-message allocation |
-| **Sharded subscriber map** | FNV-1a fan-out across 64 shards — one shard lock, no global contention |
-| **Persistent file mode** | group-commit flusher, `fdatasync`, ring survives restarts |
-| **Fetch by offset** | consumers rewind / replay from any committed offset |
-| **TLS encryption** | rustls/ring termination at the accept loop, one handshake per connection (TLS 1.3, AES-GCM) |
-| **Token auth** | constant-time shared-token gate before any data-plane command |
-| **Admin-plane auth** | HTTP Basic-auth on `/metrics`, `/health`, `/ready`; optional loopback-only bind |
-| **Zero-downtime rotation** | TLS certs and auth/HTTP tokens reload on `SIGHUP` — no restart, no dropped connections |
-| **Resilience** | connection cap via semaphore (`--max-connections`) + auth-phase timeout (`--auth-timeout-secs`) so half-open or idle clients can't wedge the broker |
-| **Honest acks** | throughput counted on acks only — no wishful numbers |
-| **Prometheus built-in** | `zhensegg_messages_total`, latency histograms, `zhensegg_auth_failures_total`, store usage, uptime |
+| | |
+|---|---|
+| **Durable group-commit** | one `fdatasync` per flush cycle; ACK strictly after media |
+| **Fetch by offset** | consumers rewind/replay from any committed offset |
+| **Overflow policy** | `--on-overflow reject` NACKs instead of silently overwriting undelivered data; per-subscriber retention watermark |
+| **Retention telemetry** | `/health` exposes `seconds_to_wrap` — size the ring from a formula, alert before it wraps |
+| **Crash auditor** | `zhensegg-bench --verify-ring` proves on-media integrity after any crash |
+| **TLS + token auth** | rustls TLS 1.3, constant-time shared-token gate — once per connection, never per message |
+| **Zero-downtime rotation** | certs and auth tokens reload on `SIGHUP` |
+| **Prometheus built-in** | message counters, latency histograms, store usage, durable lag |
 
 ## Quick start
 
@@ -72,135 +70,42 @@ cores (worst case for a broker):
 git clone https://github.com/zhensegg/queue && cd queue
 
 # in-memory, max speed
-cargo run --release --bin zhensegg-broker \
-    -- --addr 0.0.0.0:9090 --http-addr 0.0.0.0:9091 --mode mem
+cargo run --release --bin zhensegg-broker -- --mode mem --mem-mb 4096
 
 # durable, persistent ring
-cargo run --release --bin zhensegg-broker \
-    -- --mode file --file /tmp/zhensegg.ring --ring-capacity-mb 4096 --cores 4
+cargo run --release --bin zhensegg-broker -- \
+    --mode file --file /tmp/zhensegg.ring --ring-capacity-mb 4096 --cores 4 \
+    --on-overflow reject
 
-# TLS + token auth (data plane encrypted; clients must present the token first)
-cargo run --release --bin zhensegg-broker \
-    -- --mode file --file /tmp/zhensegg.ring \
-    --tls-cert /etc/tls/server.crt --tls-key /etc/tls/server.key \
-    --auth-token-file /etc/zhensegg/data.token
-
-# Prometheus endpoint
-curl http://localhost:9091/metrics
-```
-
-A whole broker — memory or disk — is a single binary with a handful of flags:
-
-```bash
-zhensegg-broker \
-    --addr 0.0.0.0:9090 \        # data plane
-    --http-addr 127.0.0.1:9091 \ # /metrics, /health, /ready
-    --mode file \
-    --file /tmp/zhensegg.ring \
-    --ring-capacity-mb 4096 \
-    --cores 4 \                  # SO_REUSEPORT per-core shards
-    --tls-cert /etc/tls/server.crt --tls-key /etc/tls/server.key \  # optional TLS
-    --auth-token-file /etc/zhensegg/data.token   # optional shared-token auth
-```
-
-Security is **opt-in and zero-cost when off**: with no `--auth-token` the auth
-gate is bypassed entirely, and without `--tls-cert/--tls-key` the data plane
-is plain TCP — the hot loop is untouched. When enabled, TLS (one handshake per
-connection) and auth (one gate per connection) never run on the steady-state
-per-message path, so RPS and latency do not regress.
-
-## Production
-
-Hardening flags for a deployed broker:
-
-| flag | meaning |
-|------|---------|
-| `--http-auth-token "…"` / `--http-auth-token-file path` | protect `/metrics`, `/health`, `/ready` with HTTP Basic auth (token compared in constant time); token file wins over inline |
-| `--http-loopback-only` | force the admin plane to bind `127.0.0.1` even if `--http-addr 0.0.0.0` |
-| `--auth-token-file path` | read the data-plane shared token from a file (survives rotation); file wins over `--auth-token` |
-| `--max-connections N` | hard cap on concurrent connections (semaphore); excess connections are dropped with a warning |
-| `--auth-timeout-secs S` | deadline (default `10`) for the TLS handshake + auth phase — an idle or half-open client can't pin a slot forever |
-| `--tls-cert` / `--tls-key` | (re)load cert/key on `SIGHUP` |
-
-**Rotating secrets & certificates without restart.** Send `SIGHUP` to the
-broker process and it atomically rereads the TLS cert/key, the data-plane
-token file, and the HTTP token file. Existing connections keep their snapshot;
-new connections and requests pick up the new material immediately:
-
-```bash
-# after replacing /etc/zhensegg/data.token and/or /etc/tls/server.{crt,key}
-kill -HUP $(pgrep zhensegg-broker)
-```
-
-**systemd.** A hardened unit is provided in [`deploy/zhensegg.service`](deploy/zhensegg.service):
-`Restart=on-failure`, `LimitNOFILE`, sandbox hardening, and a `--max-connections`
-cap baked in. Rotate live with `systemctl kill -s HUP zhensegg`.
-
-## Benchmarks
-
-Reproduce the numbers faithfully:
-
-```bash
+# measure it yourself (10-min soak + on-media durability audit)
 docker build -f benchmarks/Dockerfile -t zhensegg-bench .
 docker run --rm --privileged zhensegg-bench
+
+curl http://localhost:9091/metrics   # Prometheus
+curl http://localhost:9091/health    # durable lag, seconds_to_wrap, policy
 ```
 
-Persistent soak, producer/consumer on separate OS threads, closed-loop acks,
-`O_DIRECT` durability check — see [benchmarks/README.md](benchmarks/README.md)
-for methodology, tunables and current results.
-
-## Fuzzing & soak
-
-`fuzz/` holds a standalone crate (`zhensegg-fuzz`) that both fuzzes the real
-wire parser and soaks a *running* broker binary over TCP, in one Linux
-container:
-
-```bash
-docker build -f fuzz/Dockerfile -t zhensegg-fuzz .
-docker run --rm --privileged zhensegg-fuzz
-```
-
-The entrypoint does three independent checks and fails fast on any regression:
-
-1. **In-process, coverage-guided fuzzing** of the zero-copy wire parser
-   (`zhensegg-fuzz check`). A structure-aware generator emits valid + hostile
-   frames, byte-mutation (bit flips, insert/delete, 4-byte length overwrites,
-   duplicate chunks) drives coverage via structural frame signatures, and any
-   panicking input is saved under `fuzz-crash/`.
-2. **Dispatch soak** against a live plain-TCP+auth broker: parallel flooders
-   interleave garbage and well-formed publish/subscribe/fetch/auth frames for
-   `SOAK_SECS`, then a fresh-connection Ping probe proves the broker still
-   parses and answers. (Truncated mid-stream frames legitimately desync one
-   length-prefixed stream, so liveness is asserted on a brand-new connection.)
-3. **Live SIGHUP rotation**: a TLS+auth broker rotates its cert/key and
-   data-plane + HTTP tokens in place; the new HTTP token serves `200`, the old
-   one returns `401`, and the process survives.
-
-Tunables: `--seconds`/`--iters`/`--corpus`/`--crash` for fuzz, `--addr`
-/`--auth-token`/`--conns`/`--seconds` for soak. The container respects
-`FUZZ_SECS`, `SOAK_SECS` and `SOAK_CONNS` env vars.
-
-Fuzzing earned its keep: it found a real out-of-bounds panic — the frame parser
-indexed `buf[frame_start]` when `total_len < 9` — which was fixed in
-`src/protocol/parser.rs` with a `total_len < MIN_FRAME` guard. After the fix
-the same fuzzer ran ~1.4M iterations in a container at ~175K/s with zero
-crashes.
+A production broker is one binary with a handful of flags — sizing, overflow
+policy, rotation and recovery are covered in
+[docs/OPERATIONS.md](docs/OPERATIONS.md).
 
 ## Docs
 
 | doc | contents |
 |---|---|
-| [Benchmarks](benchmarks/README.md) | methodology, honest RPS/latency, how to reproduce in Docker |
-| [deploy/zhensegg.service](deploy/zhensegg.service) | systemd unit: hardened, restarts, live rotation via `SIGHUP` |
-| [fuzz/](fuzz/) | protocol fuzzer + TCP soak harness; parser robustness, live SIGHUP rotation |
+| [Benchmarks](docs/BENCHMARKS.md) | methodology, honest numbers, kill -9 stress, how to reproduce |
+| [Operations](docs/OPERATIONS.md) | flags, retention & overflow, monitoring, rotation, recovery |
+| [Architecture](docs/ARCHITECTURE.md) | thread-per-core, ring stores, group-commit flusher, watermark |
+| [benchmarks/](benchmarks/README.md) | the harness itself: env vars, usage |
+| [fuzz/](fuzz/) | protocol fuzzer + live TCP soak |
+| [deploy/zhensegg.service](deploy/zhensegg.service) | hardened systemd unit |
 
 ## Status
 
-Experimental, moving fast. The `mem` path is the throughput showcase; the
-`file` path is the durable production default and where the sharp edges are
-flushed out. The wire parser is under coverage-guided fuzzing, soak-tested
-against a live binary in a container, and hardened for rotation; a public
-protocol spec is next.
+Stable. The durable file path is the production default: group-commit
+flusher, retention policy, fail-stop recovery — soak-tested at ~700K msg/s for
+10-minute runs, proven against 10 consecutive `kill -9` cycles with zero data
+loss, and verified on media with `O_DIRECT`.
 
 ## License
 

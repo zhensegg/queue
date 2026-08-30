@@ -1,4 +1,5 @@
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, OnceLock};
 
 #[derive(Debug)]
 pub enum StoreError {
@@ -6,6 +7,7 @@ pub enum StoreError {
     NotFound,
     Io(std::io::Error),
     InvalidOffset,
+    Overflow,
 }
 
 impl From<std::io::Error> for StoreError {
@@ -27,6 +29,8 @@ pub trait Store: Send + Sync {
     fn sync_pending(&self, _timeout: std::time::Duration) -> u64 {
         self.write_pos()
     }
+    fn set_reject_overflow(&self, _on: bool) {}
+    fn attach_watermark(&self, _wm: Arc<AtomicU64>) {}
 }
 
 #[cfg(target_os = "linux")]
@@ -59,6 +63,8 @@ pub struct MemRing {
     write_pos: AtomicU64,
     committed: AtomicU64,
     records: AtomicU64,
+    reject_overflow: AtomicBool,
+    watermark: OnceLock<Arc<AtomicU64>>,
 }
 
 unsafe impl Sync for MemRing {}
@@ -81,6 +87,8 @@ impl MemRing {
             write_pos: AtomicU64::new(0),
             committed: AtomicU64::new(0),
             records: AtomicU64::new(0),
+            reject_overflow: AtomicBool::new(false),
+            watermark: OnceLock::new(),
         };
         #[cfg(target_os = "linux")]
         {
@@ -115,6 +123,8 @@ impl MemRing {
             write_pos: AtomicU64::new(write_pos),
             committed: AtomicU64::new(committed),
             records: AtomicU64::new(0),
+            reject_overflow: AtomicBool::new(false),
+            watermark: OnceLock::new(),
         };
         #[cfg(target_os = "linux")]
         {
@@ -139,6 +149,15 @@ impl Store for MemRing {
         let rec_len = 8 + topic.len() + payload.len();
         if rec_len > self.capacity / 2 {
             return Err(StoreError::Full);
+        }
+        let cur = self.write_pos.load(Ordering::Relaxed);
+        if self.reject_overflow.load(Ordering::Acquire)
+            && let Some(wm) = self.watermark.get()
+        {
+            let w = wm.load(Ordering::Acquire);
+            if w != u64::MAX && cur + rec_len as u64 - w > self.capacity as u64 {
+                return Err(StoreError::Overflow);
+            }
         }
         let offset = self.write_pos.fetch_add(rec_len as u64, Ordering::Relaxed);
         let start = self.mask(offset);
@@ -201,5 +220,13 @@ impl Store for MemRing {
 impl MemRing {
     pub fn committed_pos(&self) -> u64 {
         self.committed.load(Ordering::Acquire)
+    }
+
+    pub fn set_reject_overflow(&self, on: bool) {
+        self.reject_overflow.store(on, Ordering::Release);
+    }
+
+    pub fn attach_watermark(&self, wm: Arc<AtomicU64>) {
+        let _ = self.watermark.set(wm);
     }
 }

@@ -1,10 +1,11 @@
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use tracing::debug;
 
 use crate::metrics::Metrics;
-use crate::protocol::{encode_ack, encode_data, Op, Parser as ZParser};
+use crate::protocol::{encode_ack, encode_data, encode_error, Op, Parser as ZParser};
 use crate::security::AccessControl;
 use crate::store::{wait_durable, Store};
 use crate::subscription::{Subscriber, SubscriberMap};
@@ -36,6 +37,13 @@ fn give_buf(mut b: Vec<u8>) {
             }
         });
     }
+}
+
+struct PubEntry {
+    topic: Vec<u8>,
+    payload: Vec<u8>,
+    offset: u64,
+    rec_len: u32,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -130,10 +138,11 @@ where
 
     let mut authenticated = auth.initially_authenticated();
 
-    let mut parser = ZParser::new(64 * 1024);
-    let mut read_buf = vec![0u8; 64 * 1024];
+    let mut parser = ZParser::new(256 * 1024);
+    let mut read_buf = vec![0u8; 256 * 1024];
     let mut my_topics: Vec<Vec<u8>> = Vec::new();
     let auth_deadline = auth_timeout.map(|d| Instant::now() + d);
+    let mut batch: Vec<PubEntry> = Vec::with_capacity(256);
 
     let res: std::io::Result<()> = async {
         loop {
@@ -200,57 +209,41 @@ where
                         let t0 = std::time::Instant::now();
                         let topic_slice = frame.topic;
                         let payload_slice = frame.payload;
-                        let (offset, rec_len) = store
-                            .append(topic_slice, payload_slice)
-                            .map_err(|e| std::io::Error::other(format!("{e:?}")))?;
-                        metrics.append_latency
-                            .with_label_values(&["disk"])
-                            .observe(t0.elapsed().as_secs_f64());
-
-                        if durable_acks
-                            && let Some(gate) = store.durable_gate()
-                        {
-                            let need = offset + rec_len as u64;
-                            if gate.pos() < need {
-                                let wait = wait_durable(gate, need);
-                                if tokio::time::timeout(durable_ack_timeout, wait).await.is_err() {
-                                    return Err(std::io::Error::new(
-                                        std::io::ErrorKind::TimedOut,
-                                        "durable ack timeout (flusher stalled); closing without ack",
-                                    ));
-                                }
+                        match store.append(topic_slice, payload_slice) {
+                            Ok((offset, rec_len)) => {
+                                metrics.append_latency
+                                    .with_label_values(&["disk"])
+                                    .observe(t0.elapsed().as_secs_f64());
+                                metrics.messages_total.with_label_values(&["published"]).inc();
+                                metrics.messages_bytes_total.with_label_values(&["published"]).inc_by(payload_slice.len() as f64);
+                                batch.push(PubEntry {
+                                    topic: topic_slice.to_vec(),
+                                    payload: payload_slice.to_vec(),
+                                    offset,
+                                    rec_len,
+                                });
                             }
+                            Err(crate::store::StoreError::Overflow) => {
+                                metrics.messages_total.with_label_values(&["rejected"]).inc();
+                                let mut nack = Vec::with_capacity(48);
+                                encode_error(&mut nack, topic_slice, "overflow: would overwrite undelivered data (--on-overflow reject)");
+                                let _ = tx.send(Arc::new(nack));
+                            }
+                            Err(e) => return Err(std::io::Error::other(format!("{e:?}"))),
                         }
-
-                        metrics.messages_total.with_label_values(&["published"]).inc();
-                        metrics.messages_bytes_total.with_label_values(&["published"]).inc_by(payload_slice.len() as f64);
-
-                        let mut ack = Vec::with_capacity(32);
-                        encode_ack(&mut ack, topic_slice, offset, rec_len);
-                        let _ = tx.send(Arc::new(ack));
-                        metrics.messages_total.with_label_values(&["acked"]).inc();
-                        metrics.messages_bytes_total.with_label_values(&["acked"]).inc_by(payload_slice.len() as f64);
-
-                        let guard = subs.read(topic_slice);
-                            if let Some(list) = guard.get(topic_slice).filter(|l| !l.is_empty()) {
-                                let mut data = Vec::with_capacity(13 + topic_slice.len() + payload_slice.len());
-                                encode_data(&mut data, topic_slice, payload_slice);
-                                let arc = Arc::new(data);
-                                for sub in list.iter() {
-                                    let _ = sub.tx.send(arc.clone());
-                                    metrics.messages_total.with_label_values(&["delivered"]).inc();
-                                    metrics.messages_bytes_total.with_label_values(&["delivered"]).inc_by(payload_slice.len() as f64);
-                                }
-                            }
-                        debug!(connection_id = id, topic = %String::from_utf8_lossy(topic_slice), offset, "published");
                     }
                     Op::Subscribe => {
                         let topic = frame.topic.to_vec();
-                        let sub = Arc::new(Subscriber { id, tx: tx.clone() });
+                        let sub = Arc::new(Subscriber {
+                            id,
+                            tx: tx.clone(),
+                            sent: AtomicU64::new(store.write_pos()),
+                        });
                         {
                             let mut g = subs.write(&topic);
                             g.entry(topic.clone()).or_default().push(sub);
                         }
+                        subs.note_min_sent(store.write_pos());
                         my_topics.push(topic.clone());
                         metrics.subscriptions_total.inc();
                         let mut ack = Vec::with_capacity(32);
@@ -291,6 +284,51 @@ where
                 }
                 parser.consume();
             }
+
+            if !batch.is_empty() {
+                if durable_acks
+                    && let Some(gate) = store.durable_gate()
+                {
+                    let max_end = batch.iter().map(|e| e.offset + e.rec_len as u64).max().unwrap_or(0);
+                    if gate.pos() < max_end {
+                        let wait = wait_durable(gate, max_end);
+                        if tokio::time::timeout(durable_ack_timeout, wait).await.is_err() {
+                            return Err(std::io::Error::new(
+                                std::io::ErrorKind::TimedOut,
+                                "durable ack timeout (flusher stalled); closing without ack",
+                            ));
+                        }
+                    }
+                }
+                for e in batch.drain(..) {
+                    let mut ack = Vec::with_capacity(32);
+                    encode_ack(&mut ack, &e.topic, e.offset, e.rec_len);
+                    let _ = tx.send(Arc::new(ack));
+                    metrics.messages_total.with_label_values(&["acked"]).inc();
+                    metrics.messages_bytes_total.with_label_values(&["acked"]).inc_by(e.payload.len() as f64);
+
+                    let guard = subs.read(&e.topic);
+                    if let Some(list) = guard.get(&e.topic).filter(|l| !l.is_empty()) {
+                        let rec_end = e.offset + e.rec_len as u64;
+                        let mut min_sent = u64::MAX;
+                        let mut data = Vec::with_capacity(13 + e.topic.len() + e.payload.len());
+                        encode_data(&mut data, &e.topic, &e.payload);
+                        let arc = Arc::new(data);
+                        for sub in list.iter() {
+                            let _ = sub.tx.send(arc.clone());
+                            sub.sent.fetch_max(rec_end, Ordering::Relaxed);
+                            let s = sub.sent.load(Ordering::Relaxed);
+                            if s < min_sent {
+                                min_sent = s;
+                            }
+                            metrics.messages_total.with_label_values(&["delivered"]).inc();
+                            metrics.messages_bytes_total.with_label_values(&["delivered"]).inc_by(e.payload.len() as f64);
+                        }
+                        subs.note_min_sent(min_sent);
+                    }
+                    debug!(connection_id = id, topic = %String::from_utf8_lossy(&e.topic), offset = e.offset, "published");
+                }
+            }
         }
     }
     .await;
@@ -305,6 +343,7 @@ where
         }
         metrics.subscriptions_total.dec();
     }
+    subs.recompute_min_sent();
     metrics.connections_total.dec();
     drop(tx);
     let _ = writer.await;

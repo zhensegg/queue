@@ -278,3 +278,37 @@ fn test_file_ring_second_broker_rejected_by_flock() {
     drop(ring);
     let _ = std::fs::remove_file(&_path);
 }
+
+#[test]
+fn test_overflow_reject_policy_blocks_wrap_of_undelivered() {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    let ring = MemRing::new(64 * 1024);
+    ring.set_reject_overflow(true);
+    let wm = Arc::new(AtomicU64::new(0));
+    ring.attach_watermark(wm.clone());
+    let payload = vec![b'x'; 100];
+    let mut last = (0u64, 0u32);
+    for _ in 0..100000 {
+        match ring.append(b"t", &payload) {
+            Ok(v) => last = v,
+            Err(StoreError::Overflow) => break,
+            Err(e) => panic!("unexpected error: {e:?}"),
+        }
+    }
+    assert!(
+        last.0 + last.1 as u64 > 60000,
+        "ring must fill up before the first overflow rejection"
+    );
+    assert!(matches!(ring.append(b"t", &payload), Err(StoreError::Overflow)));
+    wm.store(u64::MAX, Ordering::Release);
+    assert!(ring.append(b"t", &payload).is_ok());
+}
+
+#[test]
+fn test_overflow_overwrite_default_wraps_silently() {
+    let ring = MemRing::new(64 * 1024);
+    let payload = vec![b'x'; 100];
+    for _ in 0..2000 {
+        ring.append(b"t", &payload).expect("overwrite policy must never reject");
+    }
+}
