@@ -266,7 +266,15 @@ where
                                     let mut data = Vec::new();
                                     encode_data(&mut data, st, sp);
                                     let _ = tx.send(Arc::new(data));
+                                } else {
+                                    let mut err = Vec::with_capacity(48);
+                                    encode_error(&mut err, frame.topic, "not_found");
+                                    let _ = tx.send(Arc::new(err));
                                 }
+                            } else {
+                                let mut err = Vec::with_capacity(48);
+                                encode_error(&mut err, frame.topic, "not_found");
+                                let _ = tx.send(Arc::new(err));
                             }
                         }
                     }

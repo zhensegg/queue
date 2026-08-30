@@ -188,7 +188,7 @@ impl Store for MemRing {
     }
 
     fn read(&self, offset: u64, len: u32, out: &mut Vec<u8>) -> Result<(), StoreError> {
-        let cur = self.write_pos.load(Ordering::Acquire);
+        let cur = self.committed.load(Ordering::Acquire);
         if offset + len as u64 > cur {
             return Err(StoreError::InvalidOffset);
         }
