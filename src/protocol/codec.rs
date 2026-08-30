@@ -44,3 +44,8 @@ pub fn encode_notify(buf: &mut Vec<u8>, topic: &[u8], offset: u64, len: u32) {
 pub fn encode_data(buf: &mut Vec<u8>, topic: &[u8], payload: &[u8]) {
     encode_frame(buf, Op::Data, topic, payload);
 }
+
+/// Encode an authentication frame carrying `token` in the payload.
+pub fn encode_auth(buf: &mut Vec<u8>, token: &[u8]) {
+    encode_frame(buf, Op::Auth, b"auth", token);
+}

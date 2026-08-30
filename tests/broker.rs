@@ -6,7 +6,8 @@ use tokio::net::{TcpListener, TcpStream};
 
 use zhensegg::broker::connection::handle_tokio_conn;
 use zhensegg::metrics::Metrics;
-use zhensegg::protocol::{Op, Parser, encode_fetch, encode_publish, encode_subscribe};
+use zhensegg::protocol::{Op, Parser, encode_auth, encode_fetch, encode_publish, encode_subscribe};
+use zhensegg::security::AccessControl;
 use zhensegg::store::{MemRing, Store};
 use zhensegg::subscription::{SubMap, SubscriberMap};
 
@@ -78,15 +79,20 @@ struct Harness {
     subs: SubscriberMap,
     metrics: Arc<Metrics>,
     listener: Arc<TcpListener>,
+    auth: AccessControl,
 }
 
 impl Harness {
     async fn new() -> Self {
+        Self::with_auth(AccessControl::open()).await
+    }
+
+    async fn with_auth(auth: AccessControl) -> Self {
         let store: Arc<dyn Store> = Arc::new(MemRing::new(1024 * 1024));
         let subs: SubscriberMap = Arc::new(SubMap::new(64));
         let metrics = Arc::new(Metrics::new());
         let listener = Arc::new(TcpListener::bind("127.0.0.1:0").await.unwrap());
-        Self { store, subs, metrics, listener }
+        Self { store, subs, metrics, listener, auth }
     }
 
     async fn connect(&self) -> TcpStream {
@@ -100,14 +106,16 @@ impl Harness {
         let store = self.store.clone();
         let subs = self.subs.clone();
         let metrics = self.metrics.clone();
+        let auth = self.auth.clone();
         tokio::spawn(async move {
             for i in 0..n {
                 let (stream, _) = connector.accept().await.unwrap();
                 let store = store.clone();
                 let subs = subs.clone();
                 let metrics = metrics.clone();
+                let auth = auth.clone();
                 tokio::spawn(async move {
-                    let _ = handle_tokio_conn(stream, i as u64 + 1, store, subs, metrics).await;
+                    let _ = handle_tokio_conn(stream, i as u64 + 1, store, subs, metrics, auth).await;
                 });
             }
         })
@@ -122,7 +130,63 @@ fn decode_record(raw: &[u8]) -> (Vec<u8>, Vec<u8>) {
     (topic, payload)
 }
 
-// ---- tests ----
+// ---- security / auth tests ----
+
+#[tokio::test]
+async fn broker_rejects_publish_before_auth() {
+    // Token-protected server. A client that publishes without authenticating
+    // must be rejected (connection closed) and the failure counted.
+    let h = Harness::with_auth(AccessControl::token("s3cret")).await;
+    let _server = h.spawn_servers(1);
+    let (mut w, mut r) = client(h.connect().await);
+
+    let mut frame = Vec::new();
+    encode_publish(&mut frame, b"orders", b"hack");
+    w.write_all(&frame).await.unwrap();
+
+    // No ack -> connection should be closed by the auth gate.
+    let next = r.next().await;
+    assert!(next.is_none(), "unauthorized publish must close the connection");
+    assert_eq!(h.metrics.auth_failures_total.get(), 1.0);
+}
+
+#[tokio::test]
+async fn broker_rejects_bad_token() {
+    let h = Harness::with_auth(AccessControl::token("s3cret")).await;
+    let _server = h.spawn_servers(1);
+    let (mut w, mut r) = client(h.connect().await);
+
+    let mut auth = Vec::new();
+    encode_auth(&mut auth, b"wrong-token");
+    w.write_all(&auth).await.unwrap();
+
+    let next = r.next().await;
+    assert!(next.is_none(), "bad token must close the connection");
+    assert!(h.metrics.auth_failures_total.get() >= 1.0);
+}
+
+#[tokio::test]
+async fn broker_valid_token_then_publish_works() {
+    let h = Harness::with_auth(AccessControl::token("s3cret")).await;
+    let _server = h.spawn_servers(1);
+    let (mut w, mut r) = client(h.connect().await);
+
+    let mut auth = Vec::new();
+    encode_auth(&mut auth, b"s3cret");
+    w.write_all(&auth).await.unwrap();
+    let ack = r.next().await.expect("auth ack");
+    assert_eq!(ack.op, Op::Ack);
+    assert_eq!(ack.topic.as_slice(), b"auth");
+
+    // Now the connection is authenticated: publish is honoured.
+    let mut p = Vec::new();
+    encode_publish(&mut p, b"orders", b"allowed");
+    w.write_all(&p).await.unwrap();
+    let p_ack = r.next().await.expect("publish ack");
+    assert_eq!(p_ack.op, Op::Ack);
+    assert_eq!(h.metrics.auth_successes_total.get(), 1.0);
+}
+
 
 #[tokio::test]
 async fn broker_publish_acks_and_stores_record() {

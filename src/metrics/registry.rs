@@ -3,7 +3,7 @@
 use std::time::Instant;
 
 use prometheus::{
-    Encoder, CounterVec, Gauge, HistogramOpts, HistogramVec, Opts, Registry, TextEncoder,
+    Counter, CounterVec, Encoder, Gauge, HistogramOpts, HistogramVec, Opts, Registry, TextEncoder,
 };
 
 #[derive(Clone)]
@@ -18,6 +18,8 @@ pub struct Metrics {
     pub append_latency: HistogramVec,
     pub fsync_latency: HistogramVec,
     pub broker_uptime: Gauge,
+    pub auth_failures_total: Counter,
+    pub auth_successes_total: Counter,
     start_time: Instant,
 }
 
@@ -68,6 +70,14 @@ impl Metrics {
             Opts::new("zhensegg_broker_uptime_seconds", "Broker uptime"),
         ).unwrap();
 
+        let auth_failures_total = Counter::with_opts(
+            Opts::new("zhensegg_auth_failures_total", "Rejected connections (auth failures)"),
+        ).unwrap();
+
+        let auth_successes_total = Counter::with_opts(
+            Opts::new("zhensegg_auth_successes_total", "Authenticated connections"),
+        ).unwrap();
+
         registry.register(Box::new(messages_total.clone())).unwrap();
         registry.register(Box::new(messages_bytes_total.clone())).unwrap();
         registry.register(Box::new(connections_total.clone())).unwrap();
@@ -77,6 +87,8 @@ impl Metrics {
         registry.register(Box::new(append_latency.clone())).unwrap();
         registry.register(Box::new(fsync_latency.clone())).unwrap();
         registry.register(Box::new(broker_uptime.clone())).unwrap();
+        registry.register(Box::new(auth_failures_total.clone())).unwrap();
+        registry.register(Box::new(auth_successes_total.clone())).unwrap();
 
         Self {
             registry,
@@ -89,6 +101,8 @@ impl Metrics {
             append_latency,
             fsync_latency,
             broker_uptime,
+            auth_failures_total,
+            auth_successes_total,
             start_time: Instant::now(),
         }
     }

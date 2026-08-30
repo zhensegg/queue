@@ -1,4 +1,8 @@
-//! Accept loop: spawn one connection task per inbound TCP connection.
+//! Accept loop: spawn one connection task per inbound connection.
+//!
+//! When a TLS acceptor is present, each accepted socket is first driven through
+//! the TLS handshake, then handed to the TLS connection driver. The handshake is
+//! the only TLS cost and happens once per connection, off the hot path.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -8,6 +12,7 @@ use tracing::{info, info_span, warn, Instrument};
 
 use super::connection;
 use crate::metrics::Metrics;
+use crate::security::AccessControl;
 use crate::store::Store;
 use crate::subscription::SubscriberMap;
 
@@ -18,6 +23,8 @@ pub async fn accept_loop(
     subs: SubscriberMap,
     metrics: Arc<Metrics>,
     shutting_down: Arc<AtomicBool>,
+    tls: Option<tokio_rustls::TlsAcceptor>,
+    auth: AccessControl,
 ) -> anyhow::Result<()> {
     let mut next_id: u64 = 0;
     loop {
@@ -33,9 +40,25 @@ pub async fn accept_loop(
                 let store_c = store.clone();
                 let subs_c = subs.clone();
                 let metrics_c = metrics.clone();
+                let auth_c = auth.clone();
+                let tls_c = tls.clone();
                 tokio::spawn(
                     async move {
-                        let _ = connection::handle_tokio_conn(socket, id, store_c, subs_c, metrics_c).await;
+                        match tls_c {
+                            Some(acceptor) => {
+                                match acceptor.accept(socket).await {
+                                    Ok(tls_stream) => {
+                                        let _ = connection::handle_tls_conn(tls_stream, id, store_c, subs_c, metrics_c, auth_c).await;
+                                    }
+                                    Err(e) => {
+                                        warn!(connection_id = id, error = %e, "tls handshake failed");
+                                    }
+                                }
+                            }
+                            None => {
+                                let _ = connection::handle_tokio_conn(socket, id, store_c, subs_c, metrics_c, auth_c).await;
+                            }
+                        }
                     }
                     .instrument(span),
                 );

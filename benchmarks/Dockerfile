@@ -24,7 +24,7 @@ RUN cd benchmarks && cargo build --release
 # ---- stage 2: runtime ----
 FROM ubuntu:24.04
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends ca-certificates libgcc-s1 \
+    && apt-get install -y --no-install-recommends ca-certificates libgcc-s1 openssl \
     && rm -rf /var/lib/apt/lists/*
 
 COPY --from=build /work/target/release/zhensegg-broker /usr/local/bin/zhensegg-broker

@@ -23,6 +23,20 @@ pub struct Config {
 
     #[arg(long, default_value = "1000000")]
     pub ring_capacity_mb: usize,
+
+    /// Optional shared token. When set, every client must present it as its
+    /// first Auth frame before any other command is accepted.
+    #[arg(long)]
+    pub auth_token: Option<String>,
+
+    /// Optional PEM certificate chain for TLS. When set together with
+    /// --tls-key the data plane serves TLS on `addr`.
+    #[arg(long)]
+    pub tls_cert: Option<String>,
+
+    /// Optional PEM private key for TLS.
+    #[arg(long)]
+    pub tls_key: Option<String>,
 }
 
 impl Config {

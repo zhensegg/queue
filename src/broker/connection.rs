@@ -1,4 +1,10 @@
-//! Per-connection processing: parser loop, publish/subscribe/fetch, outbound fan-out.
+//! Per-connection processing: auth gate, parser loop, publish/subscribe/fetch,
+//! outbound fan-out.
+//!
+//! The work lives in [`conn_core`], generic over the read/write halves so the
+//! same code drives both a plain TCP connection (`into_split`, zero shared
+//! state) and a TLS connection (`tokio::io::split`). Authentication and TLS
+//! handoff happen once, up front, and never touch the steady-state hot loop.
 
 use std::sync::Arc;
 
@@ -6,6 +12,7 @@ use tracing::debug;
 
 use crate::metrics::Metrics;
 use crate::protocol::{encode_ack, encode_data, Op, Parser as ZParser};
+use crate::security::AccessControl;
 use crate::store::Store;
 use crate::subscription::{Subscriber, SubscriberMap};
 
@@ -40,16 +47,49 @@ fn give_buf(mut b: Vec<u8>) {
     }
 }
 
-/// Handle one tokio connection until it closes.
+/// Handle one plain (non-TLS) tokio connection. Uses `into_split` owned halves
+/// for the zero-overhead hot path.
 pub async fn handle_tokio_conn(
     stream: tokio::net::TcpStream,
     id: u64,
     store: Arc<dyn Store>,
     subs: SubscriberMap,
     metrics: Arc<Metrics>,
+    auth: AccessControl,
 ) -> std::io::Result<()> {
+    let (read_half, write_half) = stream.into_split();
+    conn_core(read_half, write_half, id, store, subs, metrics, auth).await
+}
+
+/// Handle one TLS-terminated tokio connection (already handshaken by the accept
+/// loop). `tokio::io::split` is used because `TlsStream` has no owned halfs.
+pub async fn handle_tls_conn(
+    stream: tokio_rustls::server::TlsStream<tokio::net::TcpStream>,
+    id: u64,
+    store: Arc<dyn Store>,
+    subs: SubscriberMap,
+    metrics: Arc<Metrics>,
+    auth: AccessControl,
+) -> std::io::Result<()> {
+    let (read_half, write_half) = tokio::io::split(stream);
+    conn_core(read_half, write_half, id, store, subs, metrics, auth).await
+}
+
+/// Core connection driver, generic over the transport halves.
+pub async fn conn_core<R, W>(
+    mut read_half: R,
+    mut write_half: W,
+    id: u64,
+    store: Arc<dyn Store>,
+    subs: SubscriberMap,
+    metrics: Arc<Metrics>,
+    auth: AccessControl,
+) -> std::io::Result<()>
+where
+    R: tokio::io::AsyncRead + Unpin + Send + 'static,
+    W: tokio::io::AsyncWrite + Unpin + Send + 'static,
+{
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
-    let (mut read_half, mut write_half) = stream.into_split();
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<Arc<Vec<u8>>>();
 
     metrics.connections_total.inc();
@@ -95,6 +135,9 @@ pub async fn handle_tokio_conn(
         }
     });
 
+    // ---- auth gate: run before any data-plane command is honoured ----
+    let mut authenticated = auth.initially_authenticated();
+
     let mut parser = ZParser::new(64 * 1024);
     let mut read_buf = vec![0u8; 64 * 1024];
     let mut my_topics: Vec<Vec<u8>> = Vec::new();
@@ -107,6 +150,33 @@ pub async fn handle_tokio_conn(
             }
             parser.feed(&read_buf[..n]);
             while let Some(frame) = parser.try_parse() {
+                // Every unauthenticated connection may only send an Auth frame.
+                if !authenticated {
+                    if frame.op != Op::Auth {
+                        metrics.auth_failures_total.inc();
+                        return Err(std::io::Error::new(
+                            std::io::ErrorKind::PermissionDenied,
+                            "authentication required",
+                        ));
+                    }
+                    if auth.verify(frame.payload) {
+                        authenticated = true;
+                        let mut ack = Vec::with_capacity(32);
+                        encode_ack(&mut ack, b"auth", 0, 0);
+                        let _ = tx.send(Arc::new(ack));
+                        metrics.auth_successes_total.inc();
+                        debug!(connection_id = id, "authenticated");
+                    } else {
+                        metrics.auth_failures_total.inc();
+                        return Err(std::io::Error::new(
+                            std::io::ErrorKind::PermissionDenied,
+                            "invalid auth token",
+                        ));
+                    }
+                    parser.consume();
+                    continue;
+                }
+
                 match frame.op {
                     Op::Publish => {
                         let t0 = std::time::Instant::now();
@@ -114,7 +184,7 @@ pub async fn handle_tokio_conn(
                         let payload_slice = frame.payload;
                         let (offset, rec_len) = store
                             .append(topic_slice, payload_slice)
-                            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, format!("{e:?}")))?;
+                            .map_err(|e| std::io::Error::other(format!("{e:?}")))?;
                         metrics.append_latency
                             .with_label_values(&["disk"])
                             .observe(t0.elapsed().as_secs_f64());
@@ -179,6 +249,12 @@ pub async fn handle_tokio_conn(
                         let mut pong = Vec::new();
                         encode_ack(&mut pong, b"pong", 0, 0);
                         let _ = tx.send(Arc::new(pong));
+                    }
+                    Op::Auth => {
+                        // Re-auth is a no-op for an already authenticated connection.
+                        let mut ack = Vec::with_capacity(32);
+                        encode_ack(&mut ack, b"auth", 0, 0);
+                        let _ = tx.send(Arc::new(ack));
                     }
                     _ => {}
                 }

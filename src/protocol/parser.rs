@@ -20,6 +20,7 @@ pub enum Op {
     Ack = 0x05,
     Notify = 0x06,
     Data = 0x07,
+    Auth = 0x08,
 }
 
 impl Op {
@@ -32,6 +33,7 @@ impl Op {
             0x05 => Some(Op::Ack),
             0x06 => Some(Op::Notify),
             0x07 => Some(Op::Data),
+            0x08 => Some(Op::Auth),
             _ => None,
         }
     }
@@ -92,7 +94,7 @@ impl Parser {
     /// Reserve space and return mutable slice to read directly into.
     /// Used for vectored reads without extra copy.
     pub fn spare_mut(&mut self, want: usize) -> &mut [u8] {
-        if self.start > 0 && self.start > 4096 {
+        if self.start > 4096 {
             self.compact();
         }
         let needed = self.buf.len() + want;

@@ -21,9 +21,64 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use clap::Parser;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncWrite, AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
-use zhensegg::protocol::{Op, Parser as RingParser, encode_publish, encode_subscribe};
+use zhensegg::protocol::{Op, Parser as RingParser, encode_auth, encode_publish, encode_subscribe};
+
+// ---------------------------------------------------------------------------
+// Transport wrapper: either a plain TCP stream or a rustls client stream, so
+// the benchmark can run the identical closed-loop workload over TLS.
+// ---------------------------------------------------------------------------
+enum Conn {
+    Plain(TcpStream),
+    Tls(tokio_rustls::client::TlsStream<TcpStream>),
+}
+
+impl AsyncRead for Conn {
+    fn poll_read(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        match &mut *self {
+            Conn::Plain(s) => std::pin::Pin::new(s).poll_read(cx, buf),
+            Conn::Tls(s) => std::pin::Pin::new(s).poll_read(cx, buf),
+        }
+    }
+}
+
+impl AsyncWrite for Conn {
+    fn poll_write(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &[u8],
+    ) -> std::task::Poll<std::io::Result<usize>> {
+        match &mut *self {
+            Conn::Plain(s) => std::pin::Pin::new(s).poll_write(cx, buf),
+            Conn::Tls(s) => std::pin::Pin::new(s).poll_write(cx, buf),
+        }
+    }
+
+    fn poll_flush(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        match &mut *self {
+            Conn::Plain(s) => std::pin::Pin::new(s).poll_flush(cx),
+            Conn::Tls(s) => std::pin::Pin::new(s).poll_flush(cx),
+        }
+    }
+
+    fn poll_shutdown(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        match &mut *self {
+            Conn::Plain(s) => std::pin::Pin::new(s).poll_shutdown(cx),
+            Conn::Tls(s) => std::pin::Pin::new(s).poll_shutdown(cx),
+        }
+    }
+}
 
 static T0: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
 fn now_ns() -> u64 {
@@ -47,6 +102,71 @@ async fn tune(stream: &TcpStream) {
     tune_socket(std::os::unix::io::AsRawFd::as_raw_fd(stream));
     #[cfg(not(target_os = "linux"))]
     let _ = stream;
+}
+
+/// Build a TLS client connector trusting the given CA/self-signed PEM file.
+fn build_connector(cafile: &str) -> std::io::Result<Arc<tokio_rustls::TlsConnector>> {
+    use rustls::RootCertStore;
+    rustls::crypto::ring::default_provider().install_default().ok();
+    let mut roots = RootCertStore::empty();
+    let f = std::fs::File::open(cafile)?;
+    let mut rd = std::io::BufReader::new(f);
+    for cert in rustls_pemfile::certs(&mut rd) {
+        roots.add(cert.map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+    }
+    let config = rustls::ClientConfig::builder()
+        .with_root_certificates(roots)
+        .with_no_client_auth();
+    Ok(Arc::new(tokio_rustls::TlsConnector::from(Arc::new(config))))
+}
+
+/// Establish a transport connection and, if a token is given, authenticate.
+async fn connect_conn(
+    addr: &str,
+    tls: bool,
+    connector: Option<Arc<tokio_rustls::TlsConnector>>,
+    token: Option<&[u8]>,
+) -> std::io::Result<Conn> {
+    let tcp = TcpStream::connect(addr).await?;
+    tcp.set_nodelay(true)?;
+    tune(&tcp).await;
+
+    let mut conn = if tls {
+        let connector = connector.expect("--tls requires --cafile");
+        let name = rustls::pki_types::ServerName::try_from(addr.split(':').next().unwrap_or("localhost").to_string())
+            .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidInput, "bad server name"))?;
+        let tls_stream = connector.connect(name, tcp).await.map_err(|e| {
+            eprintln!("[conn] TLS handshake failed: {e:?}");
+            std::io::Error::new(std::io::ErrorKind::ConnectionRefused, "tls handshake")
+        })?;
+        Conn::Tls(tls_stream)
+    } else {
+        Conn::Plain(tcp)
+    };
+
+    if let Some(tok) = token {
+        let mut auth = Vec::new();
+        encode_auth(&mut auth, tok);
+        conn.write_all(&auth).await?;
+        // read the auth ack before proceeding
+        let mut parser = RingParser::new(64 * 1024);
+        let mut buf = vec![0u8; 64 * 1024];
+        loop {
+            if let Some(f) = parser.try_parse() {
+                if f.op != Op::Ack {
+                    return Err(std::io::Error::new(std::io::ErrorKind::PermissionDenied, "auth handshake failed"));
+                }
+                break;
+            }
+            let n = conn.read(&mut buf).await?;
+            if n == 0 {
+                return Err(std::io::Error::new(std::io::ErrorKind::PermissionDenied, "broker closed during auth"));
+            }
+            parser.feed(&buf[..n]);
+        }
+    }
+    Ok(conn)
 }
 
 #[derive(Parser, Debug)]
@@ -88,6 +208,18 @@ struct Args {
     /// Max e2e latency samples collected per consumer.
     #[arg(long, default_value = "100000")]
     samples: usize,
+
+    /// Connect over TLS. Requires --cafile to verify the broker cert.
+    #[arg(long)]
+    tls: bool,
+
+    /// PEM file of the CA/self-signed cert used by the broker's TLS endpoint.
+    #[arg(long)]
+    cafile: Option<String>,
+
+    /// Shared auth token sent as the first Auth frame (works with or without --tls).
+    #[arg(long)]
+    auth_token: Option<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -177,6 +309,23 @@ fn main() {
     let e2e_lat: Arc<Mutex<Vec<u64>>> = Arc::new(Mutex::new(Vec::new()));
     let disk_samples: Arc<Mutex<Vec<(u64, u64, u64)>>> = Arc::new(Mutex::new(Vec::new()));
 
+    if args.tls && args.cafile.is_none() {
+        eprintln!("[bench] --tls requires --cafile");
+        std::process::exit(2);
+    }
+    let connector: Option<Arc<tokio_rustls::TlsConnector>> = if args.tls {
+        Some(build_connector(args.cafile.as_ref().unwrap()).unwrap_or_else(|e| {
+            eprintln!("[bench] cannot build TLS connector: {e}");
+            std::process::exit(2)
+        }))
+    } else {
+        None
+    };
+    let token: Option<Vec<u8>> = args.auth_token.as_ref().map(|t| t.as_bytes().to_vec());
+    if args.tls || args.auth_token.is_some() {
+        println!("[bench] transport=secure (tls={} auth={})", args.tls, args.auth_token.is_some());
+    }
+
     // ---- start consumers FIRST so they can subscribe before loads begin ----
     let mut consumer_handles = Vec::new();
     for cid in 0..args.consumers {
@@ -184,11 +333,14 @@ fn main() {
         let consumed = consumed.clone();
         let e2e = e2e_lat.clone();
         let samples = args.samples;
+        let tls = args.tls;
+        let connector = connector.clone();
+        let token = token.clone();
         let handle = std::thread::Builder::new()
             .name(format!("consumer-{cid}"))
             .spawn(move || {
                 let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
-                let _ = rt.block_on(consumer_task(cid, addr, topic, consumed, e2e, samples));
+                let _ = rt.block_on(consumer_task(cid, addr, topic, consumed, e2e, samples, tls, connector, token));
             })
             .expect("spawn consumer");
         consumer_handles.push(handle);
@@ -209,11 +361,14 @@ fn main() {
         let batch = args.batch;
         let payload_size = args.payload_size;
         let deadline = deadline;
+        let tls = args.tls;
+        let connector = connector.clone();
+        let token = token.clone();
         let handle = std::thread::Builder::new()
             .name(format!("producer-{pid}"))
             .spawn(move || {
                 let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
-                let r = rt.block_on(producer_task(pid, addr, topic, payload_size, batch, target_per, deadline, acked, rtts, ds));
+                let r = rt.block_on(producer_task(pid, addr, topic, payload_size, batch, target_per, deadline, acked, rtts, ds, tls, connector, token));
                 if let Err(e) = r { eprintln!("[producer {pid}] err: {e:?}"); }
             })
             .expect("spawn producer");
@@ -308,10 +463,11 @@ async fn producer_task(
     acked: Arc<AtomicU64>,
     rtts: Arc<Mutex<Vec<u64>>>,
     disk_samples: Arc<Mutex<Vec<(u64, u64, u64)>>>,
+    tls: bool,
+    connector: Option<Arc<tokio_rustls::TlsConnector>>,
+    token: Option<Vec<u8>>,
 ) -> std::io::Result<()> {
-    let mut stream = TcpStream::connect(&addr).await?;
-    stream.set_nodelay(true)?;
-    tune(&stream).await;
+    let mut stream = connect_conn(&addr, tls, connector, token.as_deref()).await?;
 
     let topic_b = topic.as_bytes();
     let frame_sz = 4 + 13 + topic_b.len() + payload_size;
@@ -382,10 +538,11 @@ async fn consumer_task(
     consumed: Arc<AtomicU64>,
     e2e: Arc<Mutex<Vec<u64>>>,
     max_samples: usize,
+    tls: bool,
+    connector: Option<Arc<tokio_rustls::TlsConnector>>,
+    token: Option<Vec<u8>>,
 ) -> std::io::Result<()> {
-    let mut stream = TcpStream::connect(&addr).await?;
-    stream.set_nodelay(true)?;
-    tune(&stream).await;
+    let mut stream = connect_conn(&addr, tls, connector, token.as_deref()).await?;
     let mut sub = Vec::new();
     encode_subscribe(&mut sub, topic.as_bytes());
     stream.write_all(&sub).await?;

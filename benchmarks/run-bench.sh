@@ -22,8 +22,38 @@ PAYLOAD="${PAYLOAD:-256}"               # bytes, >=8 (first 8 carry latency ts)
 MSGS="${MSGS:-0}"                       # 0 => run by seconds
 SECS="${SECS:-30}"                      # benchmark duration in seconds (persistent soak)
 
+# Security: TLS=1 terminates TLS on the data plane; AUTH_TOKEN (if non-empty)
+# requires every client to present it before any other command.
+TLS="${TLS:-0}"
+AUTH_TOKEN="${AUTH_TOKEN:-}"
+
+BROKER_EXTRA=()
+BENCH_EXTRA=()
+
+if [ "${TLS}" = "1" ]; then
+    echo "[run] TLS enabled: generating self-signed cert for localhost"
+    CERT=/data/tls.crt
+    KEY=/data/tls.key
+    openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:P-256 \
+        -keyout "${KEY}" -out "${CERT}" -days 1 -nodes \
+        -subj "/CN=localhost" \
+        -addext "subjectAltName=DNS:localhost,IP:127.0.0.1" \
+        -addext "basicConstraints=critical,CA:FALSE" \
+        -addext "keyUsage=digitalSignature,keyEncipherment" \
+        -addext "extendedKeyUsage=serverAuth" \
+        >/dev/null 2>&1
+    BROKER_EXTRA+=(--tls-cert "${CERT}" --tls-key "${KEY}")
+    BENCH_EXTRA+=(--tls --cafile "${CERT}")
+fi
+
+if [ -n "${AUTH_TOKEN}" ]; then
+    echo "[run] auth enabled: shared token required"
+    BROKER_EXTRA+=(--auth-token "${AUTH_TOKEN}")
+    BENCH_EXTRA+=(--auth-token "${AUTH_TOKEN}")
+fi
+
 # ---- start the broker in persistent file mode ----
-echo "[run] starting broker: mode=file file=${RING_FILE} ring=${RING_MB}MB cores=${CORES}"
+echo "[run] starting broker: mode=file file=${RING_FILE} ring=${RING_MB}MB cores=${CORES} tls=${TLS} auth=${AUTH_TOKEN:+yes}"
 rm -f "${RING_FILE}"
 
 /usr/local/bin/zhensegg-broker \
@@ -32,7 +62,8 @@ rm -f "${RING_FILE}"
     --mode file \
     --file "${RING_FILE}" \
     --ring-capacity-mb "${RING_MB}" \
-    --cores "${CORES}" &
+    --cores "${CORES}" \
+    "${BROKER_EXTRA[@]}" &
 BROKER_PID=$!
 
 # give the broker time to bind the sockets and spin up the flusher
@@ -49,7 +80,8 @@ echo "[run] broker pid=${BROKER_PID} | running persistent benchmark..."
 CMD_ARGS=(--addr "${ADDR}" --topic "${TOPIC}"
           --producers "${PRODUCERS}" --consumers "${CONSUMERS}"
           --batch "${BATCH}" --payload-size "${PAYLOAD}"
-          --verify-file "${RING_FILE}")
+          --verify-file "${RING_FILE}"
+          "${BENCH_EXTRA[@]}")
 
 if [ "${MSGS}" -gt 0 ]; then
     CMD_ARGS+=(--msgs "${MSGS}")

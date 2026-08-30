@@ -12,6 +12,7 @@ use super::listener;
 use crate::config::Config;
 use crate::health::HealthState;
 use crate::metrics::Metrics;
+use crate::security::{AccessControl, build_tls_acceptor};
 use crate::store::{FileRing, MemRing, Store};
 use crate::subscription::{SubMap, SubscriberMap};
 
@@ -80,12 +81,31 @@ pub fn run_broker(config: Config) -> anyhow::Result<()> {
         });
     }
 
+    // TLS: if cert+key are configured, terminate TLS on the data plane.
+    let tls: Option<tokio_rustls::TlsAcceptor> = match (&config.tls_cert, &config.tls_key) {
+        (Some(cert), Some(key)) => {
+            info!(cert = %cert, "TLS enabled");
+            Some(build_tls_acceptor(cert, key)?)
+        }
+        (None, None) => None,
+        _ => anyhow::bail!("--tls-cert and --tls-key must be provided together"),
+    };
+
+    // Auth: a shared token makes the data plane require an Auth frame first.
+    let auth = match &config.auth_token {
+        Some(t) => {
+            info!("auth enabled (shared token)");
+            AccessControl::token(t.as_bytes())
+        }
+        None => AccessControl::open(),
+    };
+
     // Start the accept loop(s)
     let broker_store = store.clone();
     if config.cores > 1 {
-        run_multicore(&config, broker_store, subs, metrics, shutting_down.clone())?;
+        run_multicore(&config, broker_store, subs, metrics, shutting_down.clone(), tls, auth)?;
     } else {
-        run_singlecore(&config, broker_store, subs, metrics, shutting_down.clone())?;
+        run_singlecore(&config, broker_store, subs, metrics, shutting_down.clone(), tls, auth)?;
     }
 
     // Graceful drain: give connections time to flush pending writes
@@ -123,6 +143,8 @@ pub fn run_singlecore(
     subs: SubscriberMap,
     metrics: Arc<Metrics>,
     shutting_down: Arc<AtomicBool>,
+    tls: Option<tokio_rustls::TlsAcceptor>,
+    auth: AccessControl,
 ) -> anyhow::Result<()> {
     let addr = config.addr.clone();
     let rt = tokio::runtime::Builder::new_multi_thread()
@@ -133,7 +155,7 @@ pub fn run_singlecore(
     rt.block_on(async move {
         let listener = listener::bind_listener(&addr).await?;
         info!(%addr, "listening (single core)");
-        accept_loop(listener, store, subs, metrics, shutting_down).await
+        accept_loop(listener, store, subs, metrics, shutting_down, tls, auth).await
     })
 }
 
@@ -144,6 +166,8 @@ pub fn run_multicore(
     subs: SubscriberMap,
     metrics: Arc<Metrics>,
     shutting_down: Arc<AtomicBool>,
+    tls: Option<tokio_rustls::TlsAcceptor>,
+    auth: AccessControl,
 ) -> anyhow::Result<()> {
     let addr = config.addr.clone();
     let mut handles = Vec::new();
@@ -153,6 +177,8 @@ pub fn run_multicore(
         let subs_c = subs.clone();
         let metrics_c = metrics.clone();
         let shutting_down_c = shutting_down.clone();
+        let tls_c = tls.clone();
+        let auth_c = auth.clone();
         let handle = std::thread::Builder::new()
             .name(format!("zhensegg-{cid}"))
             .spawn(move || {
@@ -165,7 +191,7 @@ pub fn run_multicore(
                 rt.block_on(async move {
                     let listener = listener::bind_listener(&addr_c).await.unwrap();
                     info!(cid, addr = %addr_c, "listening (core)");
-                    let _ = accept_loop(listener, store_c, subs_c, metrics_c, shutting_down_c).await;
+                    let _ = accept_loop(listener, store_c, subs_c, metrics_c, shutting_down_c, tls_c, auth_c).await;
                 });
             })
             .expect("spawn core");
